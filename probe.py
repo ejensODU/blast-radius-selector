@@ -14,6 +14,12 @@ from functools import lru_cache
 from pathlib import Path
 
 
+# Tests after which a class-level process pool was found broken, from the last probe.
+BROKEN: list[str] = []
+# Non-empty when the last probe ran every requested class to the end.
+COMPLETE: list[bool] = []
+
+
 def _overlay(original: Path, shadow: Path, changes: dict[str, str]) -> None:
     """Copy edited files and link unchanged siblings, expanding only edited directories."""
     branches = defaultdict(dict)
@@ -137,13 +143,18 @@ def probe(
         for p in changes
     ):
         return set()
-    if _multiple_setups(root, ids):
-        return set()
     wanted = set(ids)
     passed = set()
+    BROKEN.clear()
+    COMPLETE.clear()
+    groups = {tuple(node.split("::")[:2]) for node in ids}
     for record in _invoke(root, changes, ids, timeout, "tests"):
         if isinstance(record, list):
             passed.update(wanted.intersection(record))
+        elif isinstance(record, dict) and record.get("broken") in wanted:
+            BROKEN.append(record["broken"])
+        elif isinstance(record, dict) and record.get("done") == len(groups):
+            COMPLETE.append(True)
     return passed
 
 
@@ -169,9 +180,79 @@ def check_imports(
     return records[-1] if records and isinstance(records[-1], bool) else None
 
 
+def _install_pool() -> None:
+    """Run process-pool tasks in this process, keeping the pickle boundaries.
+
+    A real pool only adds what the boundaries add: arguments are unpickled in a
+    worker, results and exceptions are unpickled in the parent, and a worker that
+    dies while unpickling leaves the pool broken for every later caller.
+    """
+    import concurrent.futures as futures
+    import pickle
+    from concurrent.futures.process import BrokenProcessPool
+
+    class Pool(futures.Executor):
+        def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+            self._broken = False
+            self._initializer = (initializer, initargs)
+            self._started = False
+
+        def _break(self, future):
+            self._broken = True
+            future.set_exception(BrokenProcessPool("A child process terminated abruptly, the process pool is not usable anymore"))
+            return future
+
+        def submit(self, fn, /, *args, **kwargs):
+            if self._broken:
+                raise BrokenProcessPool("A child process terminated abruptly, the process pool is not usable anymore")
+            future = futures.Future()
+            if not self._started:
+                self._started = True
+                initializer, initargs = self._initializer
+                if initializer is not None:
+                    try:
+                        initializer(*pickle.loads(pickle.dumps(initargs)))
+                    except BaseException:
+                        return self._break(future)
+            try:
+                payload = pickle.dumps((fn, args, kwargs))
+            except BaseException as error:
+                future.set_exception(error)
+                return future
+            try:
+                function, values, options = pickle.loads(payload)
+            except BaseException:
+                return self._break(future)
+            try:
+                outcome, failed = function(*values, **options), False
+            except BaseException as error:
+                outcome, failed = error, True
+            try:
+                packed = pickle.dumps(outcome)
+            except BaseException as error:
+                future.set_exception(error)
+                return future
+            try:
+                outcome = pickle.loads(packed)
+            except BaseException:
+                return self._break(future)
+            if failed:
+                future.set_exception(outcome)
+            else:
+                future.set_result(outcome)
+            return future
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            return None
+
+    futures.ProcessPoolExecutor = Pool
+
+
 def _run() -> None:
     import importlib
     import unittest
+
+    _install_pool()
 
     # Keep application output away from the result channel, including native-library writes.
     out = os.fdopen(os.dup(1), "w", buffering=1)
@@ -197,11 +278,20 @@ def _run() -> None:
         def __init__(self):
             super().__init__()
             self.passed = []
+            self.broke = None
 
         def addSuccess(self, test):
             super().addSuccess(test)
             self.passed.append(test)
 
+        def stopTest(self, test):
+            super().stopTest(test)
+            # A worker that dies leaves a class-level pool unusable for every later test.
+            pool = getattr(type(test), "pool", None)
+            if self.broke is None and pool is not None and getattr(pool, "_broken", False):
+                self.broke = test
+
+    finished = 0
     for (filename, classname), methods in groups.items():
         modname = filename[:-3].replace("/", ".")
         try:
@@ -225,13 +315,17 @@ def _run() -> None:
             # unittest represents module/class fixture errors with a synthetic test object.
             if any(test not in cases for test, _ in result.errors):
                 continue
+            if result.broke is not None and result.broke in cases:
+                print(json.dumps({"broken": cases[result.broke]}), file=out, flush=True)
             print(
                 json.dumps([cases[test] for test in result.passed]),
                 file=out,
                 flush=True,
             )
+            finished += 1
         except Exception:
             continue
+    print(json.dumps({"done": finished}), file=out, flush=True)
 
 
 if __name__ == "__main__":

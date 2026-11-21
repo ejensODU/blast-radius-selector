@@ -116,37 +116,124 @@ def patch_sources(text, root):
 def select(text, root, index, probe_budget, debug=False, probes=True):
     impacts = analyze(text, root)
     parts = {part.path: part for part in parse_patch(text)}
+    startup = index.profile["startup_body"]
+    # Anything that is not a plain edit inside a function body is judged by what
+    # it changes in the imported state of the library.
+    world_paths = {item.path for item in impacts
+                   if item.path.startswith("sqlglot/") and item.path.endswith(".py")
+                   and (item.kind in ("binding", "unknown")
+                        or (item.kind == "body" and item.lines.intersection(startup.get(item.path, ()))))}
+    changes = None
+    world_mask = None
+    if world_paths and probes:
+        import world
+        changes = patch_sources(text, root)
+        if changes is not None:
+            world_mask = world.candidates(root, index, {p: s for p, s in changes.items() if p.startswith("sqlglot/") and p.endswith(".py")})
+            if world_mask is not None:
+                world_mask &= index.full
     mask = 0
     for item in impacts:
+        if world_mask is not None and item.path in world_paths:
+            continue
         mask |= index.candidates(item, root, parts.get(item.path), len(parts) == 1 and len(impacts) == 1)
-    changes = None
-    if any(item.kind == "binding" for item in impacts) and mask != index.full:
+    if world_mask is not None:
+        mask |= world_mask
+    if world_mask is None and any(item.kind == "binding" for item in impacts) and mask != index.full:
         from probe import check_imports
         changes = patch_sources(text, root)
         if changes is None or probe_budget <= 0.25 or check_imports(root, changes, min(2.0, probe_budget)) is not True:
             mask = index.full
     ids = index.selected_ids(mask)
     weights = index.durations
+    probed = False
     nominal_ms = sum(weights[index.row[key]["number"]] for key in ids)
     if debug:
-        print([(item.kind, item.path) for item in impacts], len(ids), nominal_ms, file=sys.stderr)
+        print([(item.kind, item.path) for item in impacts], len(ids), nominal_ms,
+              "world" if world_mask is not None else "", file=sys.stderr)
 
     # A fresh interpreter can validate a short candidate list for a fraction of
     # the 2 seconds starting even one worker costs. Keep full coverage when a
-    # check is too costly or the result is indeterminate.
-    if (probes and ids and nominal_ms <= 700 and len(ids) <= 130 and probe_budget > 0.5
-            and any(item.kind in ("body", "binding") for item in impacts)
-            and all(item.kind in ("equivalent", "body", "binding") for item in impacts)):
+    # check is too costly or the result is indeterminate. A list that touches
+    # the optimizer's shared process pool gets a longer leash: without a probe,
+    # every later user of that pool has to be selected as well.
+    chosen = set(ids)
+    cascade = []
+    for users in pool_groups(index):
+        hit = [key for key in users if key in chosen]
+        if hit:
+            cascade.extend(key for key in users[users.index(hit[0]) + 1:] if key not in chosen)
+    number = lambda keys: [index.row[key]["number"] for key in keys]
+    plain_ms = plan_cost(schedule(number(ids), weights), weights)
+    # What it costs to leave the pool question open: every later pool user is selected.
+    open_ms = plan_cost(schedule(number(ids + cascade), weights), weights) - plain_ms if cascade else 0
+    setup_ms = (2000 if any(key.startswith("tests/test_executor.py::") for key in ids) else 0) + (100 if cascade else 0)
+    probe_ms = 1.2 * nominal_ms + setup_ms + 300
+    python_edit = any(item.kind in ("body", "binding") or item.path in world_paths for item in impacts)
+    explained = all(item.kind in ("equivalent", "body", "binding", "fixture")
+                    or (world_mask is not None and item.path in world_paths) for item in impacts)
+    # Probe a short list (it may prove that nothing fails), or a longer one when
+    # the probe is cheaper than selecting the rest of the pool's users.
+    worth = (nominal_ms <= 700 and (setup_ms < 2000 or open_ms >= 2000)) or probe_ms < open_ms
+    if probes and ids and worth and len(ids) <= 130 and probe_budget > 0.5 and python_edit and explained:
         from probe import probe
         changes = changes or patch_sources(text, root)
         if changes:
+            ids.sort(key=lambda key: index.row[key]["number"])
             # The manifest measures steady-state execution; a fresh process can
             # also pay import and class setup costs. Limit that extra CPU spend.
-            deadline = min(probe_budget, 0.85 + nominal_ms / 1000)
+            deadline = min(probe_budget, 2.0 + 2.5 * nominal_ms / 1000)
             passing = probe(root, changes, ids, deadline)
+            # Only a probe that accounted for every test says anything about the pool.
+            from probe import COMPLETE
+            probed = bool(COMPLETE)
             ids = [key for key in ids if key not in passing]
+    # A test whose task kills a worker of the class-level process pool takes
+    # down every later test that shares the pool, whatever those tests run.
+    python_change = any(part.endswith(".py") for part in parts)
+    if python_change and ids:
+        chosen = set(ids)
+        for users in pool_groups(index):
+            hit = [key for key in users if key in chosen]
+            if not hit:
+                continue
+            if probed:
+                from probe import BROKEN
+                breakers = [key for key in users if key in BROKEN]
+                first = breakers[0] if breakers else None
+            else:
+                first = hit[0]
+            if first is not None:
+                ids.extend(key for key in users[users.index(first) + 1:] if key not in chosen)
     numbers = [index.row[nodeid]["number"] for nodeid in ids]
     return schedule(numbers, weights)
+
+
+def plan_cost(workers, weights):
+    return max(sum(weights[n] for n in w) for w in workers) + 2000 * len(workers) if workers else 0
+
+
+def pool_groups(index):
+    """Tests that share one process pool, per test class, in the order pytest runs them."""
+    try:
+        users = json.loads((APP / "pool_users.json").read_text())
+    except (OSError, ValueError):
+        return []
+    groups = defaultdict(list)
+    for key in users:
+        if key in index.row:
+            groups[key.rpartition("::")[0]].append(key)
+    out = []
+    for name, members in groups.items():
+        if name.endswith("::TestOptimizer"):
+            out.append(sorted(members, key=lambda key: index.row[key]["number"]))
+    return out
+
+
+def _cpu():
+    import resource
+    own, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + kids.ru_utime + kids.ru_stime
 
 
 def main():
@@ -168,7 +255,10 @@ def main():
             if args.debug:
                 print(path.stem, end=" ", file=sys.stderr)
             budget = max(0.0, 65.0 - (time.monotonic() - start))
+            before = _cpu()
             workers = select(path.read_text(encoding="utf-8"), root, index, budget, args.debug, not args.no_probe)
+            if args.debug:
+                print(f"   cpu {_cpu() - before:.2f}s", file=sys.stderr)
         except (OSError, ValueError, RecursionError, SyntaxError, UnicodeError) as error:
             print(f"Conservative schedule for {path.stem}: {type(error).__name__}", file=sys.stderr)
             workers = full

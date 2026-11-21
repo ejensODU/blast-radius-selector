@@ -17,14 +17,12 @@ This builds for linux/amd64 and uses the organizer's run flags, including the re
 | Public sample of 30 patches | Simulated seconds | Missed commits |
 | --- | ---: | ---: |
 | Organizer's starter | 1,210.470 | 0 |
-| This entry | 109.612 | 0 |
+| This entry | 101.933 | 0 |
 | Minimum for the published failures | 94.351 | 0 |
 
-The selector captured all 73 failing test/patch pairs. Three consecutive runs of the Docker image under the organizer's run flags printed byte-identical output. The container's CPU time measured 2.7 to 4.3 seconds depending on machine load, so the local total is about 112 to 114 seconds. The minimum row is a separate after-the-fact benchmark from the public labels. For these failing sets a schedule reaches the lower bound from the longest test and the average load per worker.
+The selector captured all 73 failing test/patch pairs. Measured under the organizer's Docker run flags, the container used about 9 CPU seconds on the sample, so the local total is about 111 seconds. On 76 further patches labeled locally with full test runs (function-body mutations, class-level and module-level constants, comments, fixtures, test files, renames, deletions and syntax errors) it also captured every failing test.
 
 These checks ran the image built from this repository, which starts from the organizer's pinned linux/amd64 Python image and installs the organizer's package lock. The organizers' hidden scoring service was not part of this verification.
-
-Three further development patches changed a nested JSONPath parser, a DuckDB constant and an existing test body. Comparing the selector against full-suite pytest results gave 15 of 15 failing test/patch pairs and 5.545 simulated seconds in total. These checks informed development. The selector's 18 regression tests also pass.
 
 ## How a decision is made
 
@@ -32,13 +30,15 @@ Three further development patches changed a nested JSONPath parser, a DuckDB con
 2. Match function edits to lines executed by each test. Take the union across edits. Include observed fixture readers, test setup, inherited classes, import-time execution, and direct readers of Python source. Fresh-process import checks guard class and module bindings. Unrecognized changes can select the whole suite.
 3. For supported comparisons, inspect the relationships between operands observed in the pristine test run. A test can be removed when every observed input gives the same result under both expressions. Opaque values, missing observations and incomplete traces keep their candidates.
 4. When a small candidate set is cheap to check, run ordinary unittest methods against a temporary checkout containing the exact changes. Keep failures and inconclusive tests. The subprocess has a deadline and its own result stream. The selector can still make decisions when a probe times out.
-5. Try viable worker counts from one through eight. Assign the longest remaining test to the least-loaded worker. Choose the resulting schedule with the lowest makespan plus 2,000 ms per worker. Test identities come from the live manifest, so remapped test numbers work.
+5. An edit outside a plain function body (a class attribute, a module constant, a decorator, a default argument, a new or removed definition, an import) is judged by what it changes. The patched library is imported once in a fresh interpreter and every module global and class attribute is fingerprinted. Cells that differ from the pinned commit's snapshot are the edit's whole import-time effect, including values derived from it. Each changed cell is mapped to the tests that read it: per-key reads for dictionaries, attribute-name loads otherwise, line coverage for functions, and the importing tests when a module no longer imports.
+6. Tests that share the optimizer suite's class-level process pool are treated as one unit when a probe finds the pool broken, because a worker that dies fails every later test using that pool.
+7. Try viable worker counts from one through eight. Assign the longest remaining test to the least-loaded worker. Choose the resulting schedule with the lowest makespan plus 2,000 ms per worker. Test identities come from the live manifest, so remapped test numbers work.
 
 A 300-second miss penalty makes broad schedules worthwhile for ambiguous changes. Coverage is a measurement of a specific execution. Dynamic imports, reflective attributes, order-dependent tests, and process differences can make an unseen change reach beyond the recorded observations.
 
 ## Reproduce the profiles
 
-The three committed data files describe the unmodified SQLGlot commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. They contain test IDs, source locations, observed operand relations and dependency information. Their builders take the upstream source tree as input. The checkout, sample patches and answers are separate from the submission repository.
+The committed data files describe the unmodified SQLGlot commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. They contain test IDs, source locations, observed operand relations and dependency information. Their builders take the upstream source tree as input. The checkout, sample patches and answers are separate from the submission repository.
 
 After `make build`, regenerate the maps in a writable directory on the host. The normal competition build uses the committed maps directly.
 
@@ -51,6 +51,8 @@ docker run --rm --platform linux/amd64 -v "$PWD/profiles:/out" rwx-blast-radius 
 docker run --rm --platform linux/amd64 -v "$PWD/profiles:/out" rwx-blast-radius \
   python /app/symbols.py /opt/sqlglot /out/scalars.json
 ```
+
+Line coverage and dictionary reads are additionally recorded with every test in its own fresh interpreter (`build/isolated_lines_run.py`, `build/key_reads_run.py`) and merged (`build/merge_isolated_lines.py`, `build/merge_key_reads.py`). A single-process run credits code that is computed once and cached, such as the generator's dispatch table or a lazily imported dialect, only to the first test that triggers it. `worldfp.py` writes the import-state snapshot in `world.pkl.gz`, and `pool_users.json` lists the tests that share a process pool.
 
 The coverage builder records both class setup and test execution. It runs process-pool work in the tracing process and preserves the pickle boundary for task arguments and results. The operand builder records supported comparisons while the original tests run. The scalar index checks references to locally consumed module constants across source and fixtures. Rebuilding these maps may take several minutes.
 
