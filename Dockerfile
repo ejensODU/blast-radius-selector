@@ -13,4 +13,4 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests
 COPY . /app/
 RUN python -m compileall -q /app || true
 RUN chmod -R a+rX /app /opt/sqlglot /usr/local/lib/python3.13
-CMD ["python", "/app/selector.py"]
+CMD ["python", "/app/diag.py"]
