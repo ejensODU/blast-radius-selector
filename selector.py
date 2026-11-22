@@ -48,7 +48,7 @@ class TestIndex:
             return reads
         if item.kind == "fixture":
             if reads:
-                return reads | self.unobserved
+                return self.setup_readers(path, reads, root, part) | self.unobserved
             return self.full
         if item.kind == "body":
             # A global initialized by an executed factory can affect tests which
@@ -88,6 +88,58 @@ class TestIndex:
             # A module binding can feed imports, default arguments or cached aliases.
             return self.full
         return self.full
+
+    def setup_readers(self, path, reads, root, part):
+        """Drop readers that only meet this fixture through a class set-up they do not use.
+
+        setUpClass loads some fixtures into class attributes for every test of the
+        class. A test is reached by an edit only if it reads such an attribute and
+        inspects a position of the loaded pairs that the edit changed (recorded per
+        test in setup_reads.json), or opens the file itself.
+        """
+        try:
+            classes = json.loads((APP / "setup_reads.json").read_text())
+        except (OSError, ValueError):
+            return reads
+        for entry in classes:
+            attrs = entry["files"].get(path)
+            loaders = {attr for attr, target in entry["loaders"].items() if target == path}
+            if not attrs or not loaders or set(attrs) != loaders or part is None:
+                continue
+            try:
+                # The pinned loader, run on both versions of the file.
+                scope = {"__file__": str(root / "tests" / "helpers.py"), "__name__": "pinned_helpers"}
+                exec(compile((root / "tests" / "helpers.py").read_text(encoding="utf-8"), scope["__file__"], "exec"), scope)
+                old_text = (root / path).read_text(encoding="utf-8")
+                new_text, _ = apply_file(old_text, part)
+                import tempfile
+                pairs = []
+                for text in (old_text, new_text):
+                    with tempfile.TemporaryDirectory(prefix="fixture-") as directory:
+                        target = Path(directory, Path(path).relative_to("tests/fixtures"))
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(text, encoding="utf-8")
+                        scope["FIXTURES_DIR"] = directory
+                        pairs.append(list(scope["load_sql_fixture_pairs"](str(Path(path).relative_to("tests/fixtures")))))
+            except Exception:
+                continue  # the class set-up itself may fail: every test of the class stays
+            old_pairs, new_pairs = pairs
+            if len(old_pairs) != len(new_pairs):
+                continue
+            changed = {position for a, b in zip(old_pairs, new_pairs)
+                       for position, (x, y) in enumerate(zip(a, b)) if x != y or type(x) is not type(y)}
+            if any(len(a) != len(b) for a, b in zip(old_pairs, new_pairs)):
+                continue
+            for position, name in enumerate(self.names):
+                bit = 1 << position
+                if not reads & bit or name not in entry["touch"]:
+                    continue
+                if path in entry["body"].get(name, ()):
+                    continue
+                used = loaders.intersection(entry["touch"][name])
+                if all(changed <= set(entry["unused"].get(name, {}).get(attr, ())) for attr in used):
+                    reads &= ~bit
+        return reads
 
     def selected_ids(self, mask):
         mask &= self.full
