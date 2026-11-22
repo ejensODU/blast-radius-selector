@@ -355,7 +355,7 @@ def main():
         try:
             if args.debug:
                 print(path.stem, end=" ", file=sys.stderr)
-            budget = max(0.0, 65.0 - (time.monotonic() - start))
+            budget = max(0.0, 150.0 - (time.monotonic() - start))
             before = _cpu()
             workers = select(path.read_text(encoding="utf-8"), root, index, budget, args.debug, not args.no_probe)
             if args.debug:
