@@ -72,7 +72,11 @@ def eval_suite(kind, indices=None):
     schema_dict = TPCDS_SCHEMA if kind == "tpcds" else TPCH_SCHEMA
     rel = "optimizer/tpc-ds/tpc-ds.sql" if kind == "tpcds" else "optimizer/tpc-h/tpc-h.sql"
     sqls = list(load_sql_fixture_pairs(rel))
-    empty_tables = {tbl: Table(columns=cols, rows=[]) for tbl, cols in schema_dict.items()}
+    empty_tables = {}
+    for tbl, cols in schema_dict.items():
+        t = Table(columns=cols, rows=[])
+        t._p1_tag = tbl
+        empty_tables[tbl] = t
     schema = ensure_schema(schema_dict)
     pygen = Python().generator(identify=True, comments=False)
     want = range(len(sqls)) if indices is None else indices
@@ -87,11 +91,22 @@ def eval_suite(kind, indices=None):
         tables = ensure_tables({name: empty_tables[name] for name in tnames})
         if tables.supported_table_args and tables.supported_table_args != schema.supported_table_args:
             raise RuntimeError("supported_table_args mismatch")
+        scan_log = []
+        orig_find = tables.find
+        def logged_find(table, *args, _orig=orig_find, _log=scan_log, **kwargs):
+            res = _orig(table, *args, **kwargs)
+            _log.append([str(table), getattr(res, "_p1_tag", None), list(res.columns) if hasattr(res, "columns") else None])
+            return res
+        tables.find = logged_find
         optimized = optimize(expr, schema, leave_tables_isolated=True)
         # Run debug formatters to catch exceptions just like execute() does
         optimized.sql(pretty=True)
         plan = Plan(optimized)
         str(plan)
+        dag_sig = sorted(
+            [type(s).__name__, s.name, sorted([type(d).__name__, d.name] for d in deps)]
+            for s, deps in plan.dag.items()
+        )
         pe = PythonExecutor(tables=tables)
         gen_log = []
         orig_gen = pe.generator.generate
@@ -100,6 +115,13 @@ def eval_suite(kind, indices=None):
             _log.append(s)
             return s
         pe.generator.generate = logged_gen
+        step_cols = []
+        orig_table = pe.table
+        def logged_table(expressions, _orig=orig_table, _log=step_cols):
+            t = _orig(expressions)
+            _log.append(list(t.columns))
+            return t
+        pe.table = logged_table
         result = pe.execute(plan)
         seen_sq = set()
         while True:
@@ -117,7 +139,7 @@ def eval_suite(kind, indices=None):
         _ast_fp(optimized, ho)
         opt_fp = ho.hexdigest()
         h = hashlib.blake2b(digest_size=16)
-        h.update(json.dumps([tnames, list(rt.columns), sorted(gen_log)]).encode())
+        h.update(json.dumps([tnames, dag_sig, list(rt.columns), sorted(scan_log), sorted(step_cols), sorted(gen_log)]).encode())
         _ast_fp(optimized, h)
         py_fp = h.hexdigest()
         duck_sql = transpile(sql, write="duckdb")[0]

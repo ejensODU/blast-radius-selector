@@ -94,11 +94,11 @@ def _spawn_zygote(kind: str) -> subprocess.Popen | None:
     return proc
 
 
-def _get_zygote(world_only: bool = False) -> subprocess.Popen | None:
+def _get_zygote(kind: str = "test") -> subprocess.Popen | None:
     global _ZYGOTE, _ZYGOTE_FAILED, _WORLD_ZYGOTE, _WORLD_ZYGOTE_FAILED
     if not hasattr(os, "fork"):
         return None
-    if world_only:
+    if kind == "world":
         if _WORLD_ZYGOTE_FAILED:
             return None
         if _WORLD_ZYGOTE is not None and _WORLD_ZYGOTE.poll() is None:
@@ -181,8 +181,8 @@ def _readline_timeout(stream, deadline: float) -> bytes | None:
 
 def _invoke_zygote(shadow: Path, out_path: Path, values, timeout: float, mode: str, heavy: bool):
     """Run mode in a forked child of the pre-warmed PYTHONHASHSEED=0 zygote. Returns True if handled."""
-    world_only = (mode == "world")
-    proc = _get_zygote(world_only=world_only)
+    zkind = "world" if mode == "world" else "test"
+    proc = _get_zygote(kind=zkind)
     if proc is None or proc.stdin is None or proc.stdout is None:
         return False
     req = {"cwd": str(shadow), "out": str(out_path), "mode": mode, "values": values, "heavy": heavy}
@@ -190,24 +190,23 @@ def _invoke_zygote(shadow: Path, out_path: Path, values, timeout: float, mode: s
         proc.stdin.write((json.dumps(req) + "\n").encode())
         proc.stdin.flush()
     except OSError:
-        _stop_proc(proc)
+        _stop_proc(proc, zkind)
         return False
     deadline = time.monotonic() + timeout
     # First line reports child PID (may take ~0.5s on first heavy=True warmup).
     pid_line = _readline_timeout(proc.stdout, deadline + (5.0 if heavy else 1.0))
     if not pid_line:
-        _stop_proc(proc)
+        _stop_proc(proc, zkind)
         return False
     try:
         pid = json.loads(pid_line).get("pid")
     except Exception:
-        _stop_proc(proc)
+        _stop_proc(proc, zkind)
         return False
     if not isinstance(pid, int) or pid <= 0:
-        _stop_proc(proc)
+        _stop_proc(proc, zkind)
         return False
     done_line = _readline_timeout(proc.stdout, deadline)
-    zkey = "world" if world_only else "test"
     if done_line is None:
         try:
             os.killpg(pid, signal.SIGKILL)
@@ -221,12 +220,12 @@ def _invoke_zygote(shadow: Path, out_path: Path, values, timeout: float, mode: s
         # Wait briefly for zygote to reap child and report done.
         done_line = _readline_timeout(proc.stdout, time.monotonic() + 2.0)
         if done_line is None:
-            _stop_proc(proc, zkey)
+            _stop_proc(proc, zkind)
     if done_line:
         try:
             cpu_val = json.loads(done_line).get("cpu")
             if isinstance(cpu_val, (int, float)):
-                _LIVE_ZYGOTE_CPU[zkey] = float(cpu_val)
+                _LIVE_ZYGOTE_CPU[zkind] = float(cpu_val)
         except Exception:
             pass
     return True
@@ -380,6 +379,7 @@ def probe(
     timeout: float,
     skip_executor_setup: bool = False,
     failfast_subtest: bool = False,
+    fixture_slices: dict[str, dict] | None = None,
 ) -> set[str]:
     """Confirm ordinary unittest methods. Exclude pytest-specific setup and marks."""
     if any(
@@ -400,6 +400,8 @@ def probe(
         "skip_executor_setup": skip_executor_setup,
         "failfast_subtest": failfast_subtest,
     }
+    if fixture_slices:
+        payload["fixture_slices"] = fixture_slices
     for record in _invoke(root, changes, payload, timeout, "tests", heavy=heavy):
         if isinstance(record, list):
             passed.update(wanted.intersection(record))
@@ -521,7 +523,27 @@ def _install_pool() -> None:
         def shutdown(self, wait=True, *, cancel_futures=False):
             return None
 
+    orig_wait = futures.wait
+    orig_as_completed = futures.as_completed
+    done_not_done = getattr(futures._base, "DoneAndNotDoneFutures", lambda d, n: (d, n))
+
+    def _wait(fs, timeout=None, return_when=futures.ALL_COMPLETED):
+        fs_list = list(fs)
+        if LAZY and any(isinstance(f, Deferred) for f in fs_list):
+            return done_not_done(set(fs_list), set())
+        return orig_wait(fs_list, timeout=timeout, return_when=return_when)
+
+    def _as_completed(fs, timeout=None):
+        fs_list = list(fs)
+        if LAZY and any(isinstance(f, Deferred) for f in fs_list):
+            for f in fs_list:
+                yield f
+            return
+        yield from orig_as_completed(fs_list, timeout=timeout)
+
     futures.ProcessPoolExecutor = Pool
+    futures.wait = _wait
+    futures.as_completed = _as_completed
 
 
 class _StopSub(BaseException):
@@ -633,17 +655,40 @@ def _execute_mode(mode: str, values, out) -> None:
                 sqls = list(load_sql_fixture_pairs(rel))
                 if len(sqls) != job["size"]:
                     raise RuntimeError("size changed")
-                empty_tables = {tbl: Table(columns=cols, rows=[]) for tbl, cols in schema_dict.items()}
+                empty_tables = {}
+                for tbl, cols in schema_dict.items():
+                    t = Table(columns=cols, rows=[])
+                    t._p1_tag = tbl
+                    empty_tables[tbl] = t
                 schema = ensure_schema(schema_dict)
                 py_diff, dk_only = [], []
                 diff_budget = job.get("diff_budget")
                 costs = job.get("costs")
                 opt_only = bool(job.get("opt_only")) and kind == "tpcds"
+                duckdb_only = bool(job.get("duckdb_only")) and kind == "tpcds"
                 diff_cost = 0
                 aborted = False
                 for i in indices:
                     meta, sql, _ = sqls[i]
                     exp_i = expected[str(i)]
+                    if duckdb_only and "dk_fp" in exp_i:
+                        if not meta.get("execute"):
+                            if exp_i["exec"]:
+                                py_diff.append(i)
+                            continue
+                        if not exp_i["exec"]:
+                            py_diff.append(i)
+                            continue
+                        duck_sql = transpile(sql, write="duckdb")[0]
+                        dk_fp = hashlib.blake2b(duck_sql.encode(), digest_size=16).hexdigest()
+                        if dk_fp != exp_i["dk_fp"]:
+                            dk_only.append(i)
+                            if costs:
+                                diff_cost += costs[i]
+                        if diff_budget is not None and diff_cost > diff_budget:
+                            aborted = True
+                            break
+                        continue
                     expr = pickle.loads(pickle.dumps(parse_one(sql)))
                     if not meta.get("execute"):
                         if exp_i["exec"]:
@@ -669,10 +714,21 @@ def _execute_mode(mode: str, values, out) -> None:
                     tables = ensure_tables({name: empty_tables[name] for name in tnames})
                     if tables.supported_table_args and tables.supported_table_args != schema.supported_table_args:
                         raise RuntimeError("supported_table_args mismatch")
+                    scan_log = []
+                    orig_find = tables.find
+                    def logged_find(table, *args, _orig=orig_find, _log=scan_log, **kwargs):
+                        res = _orig(table, *args, **kwargs)
+                        _log.append([str(table), getattr(res, "_p1_tag", None), list(res.columns) if hasattr(res, "columns") else None])
+                        return res
+                    tables.find = logged_find
                     optimized = optimize(expr, schema, leave_tables_isolated=True)
                     optimized.sql(pretty=True)
                     plan = Plan(optimized)
                     str(plan)
+                    dag_sig = sorted(
+                        [type(s).__name__, s.name, sorted([type(d).__name__, d.name] for d in deps)]
+                        for s, deps in plan.dag.items()
+                    )
                     pe = PythonExecutor(tables=tables)
                     gen_log = []
                     orig_gen = pe.generator.generate
@@ -681,6 +737,13 @@ def _execute_mode(mode: str, values, out) -> None:
                         _log.append(s)
                         return s
                     pe.generator.generate = logged_gen
+                    step_cols = []
+                    orig_table = pe.table
+                    def logged_table(expressions, _orig=orig_table, _log=step_cols):
+                        t = _orig(expressions)
+                        _log.append(list(t.columns))
+                        return t
+                    pe.table = logged_table
                     result = pe.execute(plan)
                     seen_sq = set()
                     while True:
@@ -693,7 +756,7 @@ def _execute_mode(mode: str, values, out) -> None:
                             pe.execute(subplan)
                     rt = pickle.loads(pickle.dumps(result))
                     h = hashlib.blake2b(digest_size=16)
-                    h.update(json.dumps([tnames, list(rt.columns), sorted(gen_log)]).encode())
+                    h.update(json.dumps([tnames, dag_sig, list(rt.columns), sorted(scan_log), sorted(step_cols), sorted(gen_log)]).encode())
                     _ast_fp(optimized, h)
                     py_fp = h.hexdigest()
                     duck_sql = transpile(sql, write="duckdb")[0]
@@ -903,10 +966,13 @@ def _execute_mode(mode: str, values, out) -> None:
 
     skip_executor_setup = False
     failfast_subtest = False
+    fixture_slices = {}
     if isinstance(values, dict):
         skip_executor_setup = bool(values.get("skip_executor_setup"))
         failfast_subtest = bool(values.get("failfast_subtest"))
+        fixture_slices = values.get("fixture_slices") or {}
         values = values.get("ids", [])
+    LAZY = bool(failfast_subtest)
     for node in values:
         parts = node.split("::")
         if len(parts) == 3 and parts[0].endswith(".py"):
@@ -961,9 +1027,32 @@ def _execute_mode(mode: str, values, out) -> None:
                     and not any(m in {"test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"} for m, _ in methods)):
                 cls.setUpClass = classmethod(lambda c: None)
                 cls.tearDownClass = classmethod(lambda c: None)
+            slice_by_method = (
+                {m: fixture_slices[node] for m, node in methods if node in fixture_slices}
+                if (failfast_subtest and fixture_slices)
+                else {}
+            )
             if failfast_subtest:
                 orig_call = cls._callTestMethod
-                def _wrapped_call(self, method, _orig=orig_call):
+                def _wrapped_call(self, method, _orig=orig_call, _sbm=slice_by_method, _mod=module):
+                    spec = _sbm.get(self._testMethodName)
+                    if spec is not None and hasattr(_mod, "load_sql_fixture_pairs"):
+                        orig_loader = _mod.load_sql_fixture_pairs
+                        rel, idxs, sz = spec["rel"], spec["indices"], spec["size"]
+                        def _sliced_loader(f, _ol=orig_loader, _rel=rel, _idxs=idxs, _sz=sz):
+                            if f != _rel:
+                                return _ol(f)
+                            all_pairs = list(_ol(f))
+                            if len(all_pairs) != _sz:
+                                raise RuntimeError("fixture list changed length")
+                            return iter([all_pairs[i] for i in _idxs])
+                        _mod.load_sql_fixture_pairs = _sliced_loader
+                        try:
+                            return _orig(self, method)
+                        except _StopSub:
+                            return None
+                        finally:
+                            _mod.load_sql_fixture_pairs = orig_loader
                     try:
                         return _orig(self, method)
                     except _StopSub:
@@ -988,11 +1077,18 @@ def _execute_mode(mode: str, values, out) -> None:
     print(json.dumps({"done": finished}), file=out, flush=True)
 
 
-def _zygote_loop(world_only: bool = False) -> None:
+def _zygote_loop(kind: str = "test") -> None:
     app_dir = str(Path(__file__).resolve().parent)
     if app_dir not in sys.path:
         sys.path.append(app_dir)
-    if world_only:
+    # Keep protocol channel on private stdout fd; child redirects stdout/stderr to devnull.
+    proto_out = os.fdopen(os.dup(1), "w", buffering=1)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull_fd, 1)
+    os.dup2(devnull_fd, 2)
+    os.close(devnull_fd)
+
+    if kind == "world":
         # Must NOT import unittest or logging, which would alter UNITTEST / logger fingerprints!
         import worldfp  # noqa: F401
     else:
@@ -1010,12 +1106,6 @@ def _zygote_loop(world_only: bool = False) -> None:
 
     heavy_loaded = False
     base_pypath = os.environ.get("PYTHONPATH", "")
-    # Keep protocol channel on private stdout fd; child redirects stdout/stderr to devnull.
-    proto_out = os.fdopen(os.dup(1), "w", buffering=1)
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull_fd, 1)
-    os.dup2(devnull_fd, 2)
-    os.close(devnull_fd)
 
     proto_out.write("READY\n")
     proto_out.flush()
@@ -1024,7 +1114,7 @@ def _zygote_loop(world_only: bool = False) -> None:
         if not line.strip():
             continue
         req = json.loads(line)
-        if not world_only and req.get("heavy") and not heavy_loaded:
+        if kind != "world" and req.get("heavy") and not heavy_loaded:
             try:
                 import numpy  # noqa: F401
                 import pandas  # noqa: F401
@@ -1067,10 +1157,10 @@ def _zygote_loop(world_only: bool = False) -> None:
 
 def _run() -> None:
     if sys.argv[-1] == "zygote":
-        _zygote_loop(world_only=False)
+        _zygote_loop(kind="test")
         return
     if sys.argv[-1] == "world_zygote":
-        _zygote_loop(world_only=True)
+        _zygote_loop(kind="world")
         return
     # Keep application output away from the result channel, including native-library writes.
     out = os.fdopen(os.dup(1), "w", buffering=1)

@@ -73,3 +73,57 @@ class ProbeTests(unittest.TestCase):
             passed = probe(root, {"x.py": "X = 1\n"}, ids, timeout=10.0, failfast_subtest=True)
             self.assertEqual(passed, {"t.py::T::test_ok"})
             self.assertTrue(bool(COMPLETE))
+
+    def test_lazy_pool_failfast_skips_later_subtests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "ran.log"
+            (root / "t.py").write_text(
+                "import unittest\n"
+                "from concurrent.futures import ProcessPoolExecutor, as_completed, wait\n"
+                "def worker(i, path):\n"
+                "    with open(path, 'a') as f: f.write(f'{i}\\n')\n"
+                "    return i\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_lazy(self):\n"
+                f"        p = {str(marker)!r}\n"
+                "        with ProcessPoolExecutor() as pool:\n"
+                "            futs = [pool.submit(worker, i, p) for i in range(5)]\n"
+                "            wait(futs)\n"
+                "            for fut in as_completed(futs):\n"
+                "                with self.subTest(fut=fut):\n"
+                "                    val = fut.result()\n"
+                "                    self.assertNotEqual(val, 1)\n"
+            )
+            passed = probe(root, {"x.py": "X = 1\n"}, ["t.py::T::test_lazy"], timeout=10.0, failfast_subtest=True)
+            self.assertEqual(passed, set())
+            self.assertEqual(marker.read_text().splitlines(), ["0", "1"])
+
+    def test_fixture_slices_filters_only_target_rel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "t.py").write_text(
+                "import unittest\n"
+                "def load_sql_fixture_pairs(rel):\n"
+                "    if rel == 'target.sql': return [(0, 'ok'), (1, 'bad'), (2, 'ok')]\n"
+                "    return [(0, 'other')]\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_sliced(self):\n"
+                "        other = list(load_sql_fixture_pairs('other.sql'))\n"
+                "        self.assertEqual(len(other), 1)\n"
+                "        for _, val in load_sql_fixture_pairs('target.sql'):\n"
+                "            self.assertEqual(val, 'ok')\n"
+            )
+            nid = "t.py::T::test_sliced"
+            # Slicing to [0, 2] skips index 1 ('bad') and still checks other.sql
+            passed = probe(
+                root, {"x.py": "X = 1\n"}, [nid], timeout=10.0, failfast_subtest=True,
+                fixture_slices={nid: {"rel": "target.sql", "indices": [0, 2], "size": 3}},
+            )
+            self.assertEqual(passed, {nid})
+            # Wrong expected size conservatively fails the test
+            passed_bad = probe(
+                root, {"x.py": "X = 1\n"}, [nid], timeout=10.0, failfast_subtest=True,
+                fixture_slices={nid: {"rel": "target.sql", "indices": [0], "size": 2}},
+            )
+            self.assertEqual(passed_bad, set())
