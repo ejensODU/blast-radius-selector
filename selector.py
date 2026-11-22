@@ -165,13 +165,18 @@ def patch_sources(text, root):
     return result or None
 
 
+LAST = {}
+
+
 def select(text, root, index, probe_budget, debug=False, probes=True):
+    LAST.clear()
     # Added, deleted, renamed and unread files, and reshaped test modules, are
     # answered from recorded file and line dependencies; the rest goes on below.
     if not text.strip():
         return []  # an empty patch changes nothing
     import structure
     plain, extra = structure.resolve(text, index, root)
+    LAST.update(structural=plain != text, structural_full=extra is structure.FULL)
     if extra is structure.FULL:
         return schedule([row["number"] for row in index.row.values()], index.durations)
     if plain != text:
@@ -211,6 +216,10 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         if changes is None or probe_budget <= 0.25 or check_imports(root, changes, min(2.0, probe_budget)) is not True:
             mask = index.full
     ids = index.selected_ids(mask)
+    LAST.update(impacts=[(item.kind, item.path) for item in impacts], world_paths=bool(world_paths),
+                world_none=bool(world_paths) and world_mask is None,
+                world_full=world_mask is not None and world_mask == index.full,
+                pre=len(ids), cascade=False, probed=False)
     weights = index.durations
     probed = False
     nominal_ms = sum(weights[index.row[key]["number"]] for key in ids)
@@ -260,10 +269,12 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             ids.sort(key=lambda key: index.row[key]["number"])
             # The limit only has to stop a patch that hangs; leave room for a slower machine.
             deadline = min(probe_budget, 3.0 + 3.0 * cpu_ms / 1000)
+            LAST["tried"] = True
             passing = probe(root, changes, ids, deadline)
             # Only a probe that accounted for every test says anything about the pool.
             from probe import COMPLETE
             probed = bool(COMPLETE)
+            LAST["probed"] = probed
             ids = [key for key in ids if key not in passing]
     if fragile and ids:
         chosen = set(ids)
@@ -278,6 +289,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             else:
                 first = hit[0]
             if first is not None:
+                LAST["cascade"] = True
                 ids.extend(key for key in users[users.index(first) + 1:] if key not in chosen)
     if extra:
         chosen = set(ids)
