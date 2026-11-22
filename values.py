@@ -299,20 +299,20 @@ class OperandRecorder:
     def observe(self, site, op, a, b):
         if self.in_observe:
             return OPS[op](a, b)
-        self.in_observe = True
         try:
-            try:
-                value = OPS[op](a, b)
-            except BaseException:
-                if self.active:
-                    self.current.add((site, None))
-                raise
+            value = OPS[op](a, b)
+        except BaseException:
             if self.active:
+                self.current.add((site, None))
+            raise
+        if self.active:
+            self.in_observe = True
+            try:
                 state = relation(a, b, op, value) if type(value) is bool else None
-                self.current.add((site, state))
-            return value
-        finally:
-            self.in_observe = False
+            finally:
+                self.in_observe = False
+            self.current.add((site, state))
+        return value
 
     def flush(self, new_mask, track_lines=False):
         self.mon.set_events(self.tool_id, 0)
@@ -481,21 +481,9 @@ def _literal_unchanged(op, state, old_rhs, new_rhs):
     return all(interpreted(op, (False, value)) == interpreted(op, state) for value in possible)
 
 
-_NESTED_COMPARE_SCOPES = frozenset({
-    "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__hash__",
-})
-
-
 def refine(impact, source_root, filepatch, mapdata, profile=None):
     """Return tests that may observe a change to this comparison, or None."""
     if impact.kind != 'body':
-        return None
-    # Nested comparisons inside dunder comparison/hash hooks or _Dialect are suppressed
-    # during recording (observe() skips re-entrant calls while line_seen still marks the line).
-    if impact.scope and (
-        impact.scope[0] == "_Dialect"
-        or any(s in _NESTED_COMPARE_SCOPES for s in impact.scope)
-    ):
         return None
     if profile is None:
         profile = _load()

@@ -48,10 +48,45 @@ def _ast_fp(node, h):
             h.update(b";")
 
 
+def _plan_fp(plan, h):
+    """Feed structural & scalar Step attributes (limit, offset, join side, distinct, etc.) deterministically."""
+    sigs = []
+    for s in plan.dag:
+        rec = [
+            type(s).__name__,
+            s.name,
+            repr(getattr(s, "limit", None)),
+            repr(getattr(s, "offset", None)),
+            sorted([type(d).__name__, d.name] for d in getattr(s, "dependencies", ())),
+            len(getattr(s, "projections", ())),
+            getattr(s, "condition", None) is not None,
+        ]
+        if hasattr(s, "joins"):
+            rec.append(getattr(s, "source_name", None))
+            rec.append(sorted(
+                [k, j.get("side"), len(j.get("source_key", ())), len(j.get("join_key", ())), j.get("condition") is not None]
+                for k, j in s.joins.items()
+            ))
+        if hasattr(s, "distinct"):
+            op = getattr(s, "op", None)
+            rec.append([op.__name__ if isinstance(op, type) else repr(op),
+                        getattr(s, "left", None), getattr(s, "right", None), bool(s.distinct)])
+        if hasattr(s, "group"):
+            rec.append([getattr(s, "source", None), sorted(s.group.keys()), len(s.aggregations), len(s.operands)])
+        if hasattr(s, "key"):
+            rec.append(len(s.key))
+        sigs.append(json.dumps(rec, separators=(",", ":")))
+    sigs.sort()
+    h.update(b"PLAN:")
+    for sig in sigs:
+        h.update(sig.encode())
+        h.update(b"\n")
+
+
 def eval_suite(kind, indices=None):
     """Compute deterministic Phase-1 fingerprints for TPC-DS / TPC-H / optimized TPC-H queries."""
-    from sqlglot import exp, find_tables, parse_one, transpile
-    from sqlglot.executor.python import Python, PythonExecutor
+    from sqlglot import find_tables, parse_one, transpile
+    from sqlglot.executor.python import PythonExecutor
     from sqlglot.executor.table import Table, ensure_tables
     from sqlglot.optimizer import optimize
     from sqlglot.planner import Plan
@@ -78,7 +113,6 @@ def eval_suite(kind, indices=None):
         t._p1_tag = tbl
         empty_tables[tbl] = t
     schema = ensure_schema(schema_dict)
-    pygen = Python().generator(identify=True, comments=False)
     want = range(len(sqls)) if indices is None else indices
     out = {}
     for i in want:
@@ -99,7 +133,6 @@ def eval_suite(kind, indices=None):
             return res
         tables.find = logged_find
         optimized = optimize(expr, schema, leave_tables_isolated=True)
-        # Run debug formatters to catch exceptions just like execute() does
         optimized.sql(pretty=True)
         plan = Plan(optimized)
         str(plan)
@@ -124,6 +157,7 @@ def eval_suite(kind, indices=None):
         pe.table = logged_table
         result = pe.execute(plan)
         seen_sq = set()
+        subplans = []
         while True:
             todo = sorted(k for k in pe._subquery_plans if k not in seen_sq)
             if not todo:
@@ -131,9 +165,9 @@ def eval_suite(kind, indices=None):
             for k in todo:
                 seen_sq.add(k)
                 subplan, _ = pe._subquery_plans[k]
+                subplans.append((k, subplan))
                 pe.execute(subplan)
         rt = pickle.loads(pickle.dumps(result))
-        # Deterministic fingerprint: opt_fp (for optimizer-only edits) and full py_fp
         ho = hashlib.blake2b(digest_size=16)
         ho.update(json.dumps(tnames).encode())
         _ast_fp(optimized, ho)
@@ -141,6 +175,10 @@ def eval_suite(kind, indices=None):
         h = hashlib.blake2b(digest_size=16)
         h.update(json.dumps([tnames, dag_sig, list(rt.columns), sorted(scan_log), sorted(step_cols), sorted(gen_log)]).encode())
         _ast_fp(optimized, h)
+        _plan_fp(plan, h)
+        for k, sp in sorted(subplans, key=lambda kv: kv[0]):
+            h.update(f"SUB:{k};".encode())
+            _plan_fp(sp, h)
         py_fp = h.hexdigest()
         duck_sql = transpile(sql, write="duckdb")[0]
         dk_fp = hashlib.blake2b(duck_sql.encode(), digest_size=16).hexdigest()
@@ -159,18 +197,18 @@ def main():
     t0 = time.process_time()
     tpcds_a = eval_suite("tpcds")
     tpcds_b = eval_suite("tpcds")
-    assert tpcds_a == tpcds_b, f"NON-DETERMINISTIC: {[i for i in tpcds_a if tpcds_a[i] != tpcds_b[i]]}"
-    tpch_a = eval_suite("tpch")
-    opt_a = eval_suite("opt_tpch")
-    t1 = time.process_time()
+    assert tpcds_a == tpcds_b, "tpcds Phase-1 not deterministic!"
+    tpch = eval_suite("tpch")
+    opt_tpch = eval_suite("opt_tpch")
     data = {
-        "row_exec_lines": row_exec,
+        "row_exec_lines": row_exec["row_exec_lines"],
         "tpcds": [tpcds_a[i] for i in range(len(tpcds_a))],
-        "tpch": [tpch_a[i] for i in range(len(tpch_a))],
-        "opt_tpch": [opt_a[i] for i in range(len(opt_a))],
+        "tpch": [tpch[i] for i in range(len(tpch))],
+        "opt_tpch": [opt_tpch[i] for i in range(len(opt_tpch))],
     }
-    json.dump(data, open(dest, "w"), separators=(",", ":"))
-    print(f"built {dest} in {t1-t0:.2f}s (2x tpcds verified 100% deterministic); size={os.path.getsize(dest)}B")
+    with open(dest, "w") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    print(f"wrote {dest} ({os.path.getsize(dest)} bytes) in {time.process_time()-t0:.2f}s CPU; deterministic=True")
 
 
 if __name__ == "__main__":

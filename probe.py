@@ -30,6 +30,59 @@ _WORLD_ZYGOTE: subprocess.Popen | None = None
 _WORLD_ZYGOTE_FAILED = False
 _LIVE_ZYGOTE_CPU: dict[str, float] = {"test": 0.0, "world": 0.0}
 
+# Exact set of sqlglot files loaded by a plain `import sqlglot`.
+_SQLGLOT_IMPORT_FILES = frozenset({
+    "sqlglot/__init__.py",
+    "sqlglot/_typing.py",
+    "sqlglot/dialects/__init__.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/diff.py",
+    "sqlglot/errors.py",
+    "sqlglot/expressions/__init__.py",
+    "sqlglot/expressions/aggregate.py",
+    "sqlglot/expressions/array.py",
+    "sqlglot/expressions/builders.py",
+    "sqlglot/expressions/constraints.py",
+    "sqlglot/expressions/core.py",
+    "sqlglot/expressions/datatypes.py",
+    "sqlglot/expressions/ddl.py",
+    "sqlglot/expressions/dml.py",
+    "sqlglot/expressions/functions.py",
+    "sqlglot/expressions/json.py",
+    "sqlglot/expressions/math.py",
+    "sqlglot/expressions/properties.py",
+    "sqlglot/expressions/query.py",
+    "sqlglot/expressions/string.py",
+    "sqlglot/expressions/temporal.py",
+    "sqlglot/generator.py",
+    "sqlglot/helper.py",
+    "sqlglot/jsonpath.py",
+    "sqlglot/optimizer/__init__.py",
+    "sqlglot/optimizer/scope.py",
+    "sqlglot/parser.py",
+    "sqlglot/parsers/__init__.py",
+    "sqlglot/parsers/base.py",
+    "sqlglot/schema.py",
+    "sqlglot/time.py",
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/tokens.py",
+    "sqlglot/trie.py",
+    "sqlglot/typing/__init__.py",
+})
+
+
+def can_preimport_sqlglot(root: Path, changes: dict[str, str] | None, mode: str = "tests") -> bool:
+    if mode not in ("tests", "phase1", "slices", "opt_slices") or not changes:
+        return False
+    if not (root / "sqlglot" / "__init__.py").is_file():
+        return False
+    for p in changes:
+        if not p.startswith(("sqlglot/", "tests/fixtures/")):
+            return False
+        if p in _SQLGLOT_IMPORT_FILES:
+            return False
+    return True
+
 
 def _stop_proc(proc: subprocess.Popen | None, key: str | None = None) -> None:
     if key is not None:
@@ -179,13 +232,30 @@ def _readline_timeout(stream, deadline: float) -> bytes | None:
     return line if line else None
 
 
-def _invoke_zygote(shadow: Path, out_path: Path, values, timeout: float, mode: str, heavy: bool):
+def _invoke_zygote(
+    shadow: Path,
+    out_path: Path,
+    values,
+    timeout: float,
+    mode: str,
+    heavy: bool,
+    preimport_sg: bool = False,
+    sg_root: str = "",
+):
     """Run mode in a forked child of the pre-warmed PYTHONHASHSEED=0 zygote. Returns True if handled."""
     zkind = "world" if mode == "world" else "test"
     proc = _get_zygote(kind=zkind)
     if proc is None or proc.stdin is None or proc.stdout is None:
         return False
-    req = {"cwd": str(shadow), "out": str(out_path), "mode": mode, "values": values, "heavy": heavy}
+    req = {
+        "cwd": str(shadow),
+        "out": str(out_path),
+        "mode": mode,
+        "values": values,
+        "heavy": heavy,
+        "preimport_sg": preimport_sg,
+        "sg_root": sg_root,
+    }
     try:
         proc.stdin.write((json.dumps(req) + "\n").encode())
         proc.stdin.flush()
@@ -245,8 +315,10 @@ def _invoke(root, changes, values, timeout, mode, heavy=False):
             shadow = base / "src"
             shadow.mkdir()
             out_path = base / "out.jsonl"
-            _overlay(root.resolve(), shadow, changes)
-            if _invoke_zygote(shadow, out_path, values, timeout, mode, heavy):
+            resolved_root = root.resolve()
+            _overlay(resolved_root, shadow, changes)
+            pre_sg = can_preimport_sqlglot(resolved_root, changes, mode)
+            if _invoke_zygote(shadow, out_path, values, timeout, mode, heavy, preimport_sg=pre_sg, sg_root=str(resolved_root)):
                 raw = out_path.read_bytes() if out_path.exists() else b""
             else:
                 child = subprocess.Popen(
@@ -633,6 +705,39 @@ def _execute_mode(mode: str, values, out) -> None:
                     h.update(repr(cur).encode())
                     h.update(b";")
 
+        def _plan_fp(plan, h):
+            sigs = []
+            for s in plan.dag:
+                rec = [
+                    type(s).__name__,
+                    s.name,
+                    repr(getattr(s, "limit", None)),
+                    repr(getattr(s, "offset", None)),
+                    sorted([type(d).__name__, d.name] for d in getattr(s, "dependencies", ())),
+                    len(getattr(s, "projections", ())),
+                    getattr(s, "condition", None) is not None,
+                ]
+                if hasattr(s, "joins"):
+                    rec.append(getattr(s, "source_name", None))
+                    rec.append(sorted(
+                        [k, j.get("side"), len(j.get("source_key", ())), len(j.get("join_key", ())), j.get("condition") is not None]
+                        for k, j in s.joins.items()
+                    ))
+                if hasattr(s, "distinct"):
+                    op = getattr(s, "op", None)
+                    rec.append([op.__name__ if isinstance(op, type) else repr(op),
+                                getattr(s, "left", None), getattr(s, "right", None), bool(s.distinct)])
+                if hasattr(s, "group"):
+                    rec.append([getattr(s, "source", None), sorted(s.group.keys()), len(s.aggregations), len(s.operands)])
+                if hasattr(s, "key"):
+                    rec.append(len(s.key))
+                sigs.append(json.dumps(rec, separators=(",", ":")))
+            sigs.sort()
+            h.update(b"PLAN:")
+            for sig in sigs:
+                h.update(sig.encode())
+                h.update(b"\n")
+
         for job in values:
             test_id = job["test"]
             kind = job["kind"]
@@ -753,6 +858,7 @@ def _execute_mode(mode: str, values, out) -> None:
                     pe.table = logged_table
                     result = pe.execute(plan)
                     seen_sq = set()
+                    subplans = []
                     while True:
                         todo = sorted(k for k in pe._subquery_plans if k not in seen_sq)
                         if not todo:
@@ -760,11 +866,16 @@ def _execute_mode(mode: str, values, out) -> None:
                         for k in todo:
                             seen_sq.add(k)
                             subplan, _ = pe._subquery_plans[k]
+                            subplans.append((k, subplan))
                             pe.execute(subplan)
                     rt = pickle.loads(pickle.dumps(result))
                     h = hashlib.blake2b(digest_size=16)
                     h.update(json.dumps([tnames, dag_sig, list(rt.columns), sorted(scan_log), sorted(step_cols), sorted(gen_log)]).encode())
                     _ast_fp(optimized, h)
+                    _plan_fp(plan, h)
+                    for k, sp in sorted(subplans, key=lambda kv: kv[0]):
+                        h.update(f"SUB:{k};".encode())
+                        _plan_fp(sp, h)
                     py_fp = h.hexdigest()
                     duck_sql = transpile(sql, write="duckdb")[0]
                     dk_fp = hashlib.blake2b(duck_sql.encode(), digest_size=16).hexdigest()
@@ -1133,55 +1244,205 @@ def _zygote_loop(kind: str = "test") -> None:
         import unittest  # noqa: F401
         import unittest.mock  # noqa: F401
 
+    import resource
+
     heavy_loaded = False
     base_pypath = os.environ.get("PYTHONPATH", "")
+    sg_pid = None
+    sg_w = None
+    sg_r = None
+    sg_root_loaded = ""
+    sg_live_cpu = 0.0
 
-    proto_out.write("READY\n")
-    proto_out.flush()
-
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        req = json.loads(line)
-        if kind != "world" and req.get("heavy") and not heavy_loaded:
+    def _close_sg() -> None:
+        nonlocal sg_pid, sg_w, sg_r, sg_root_loaded, sg_live_cpu
+        for fh in (sg_w, sg_r):
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        if sg_pid is not None:
             try:
-                import numpy  # noqa: F401
-                import pandas  # noqa: F401
-                import duckdb  # noqa: F401
-            except Exception:
+                os.waitpid(sg_pid, 0)
+            except ChildProcessError:
                 pass
-            heavy_loaded = True
-        pid = os.fork()
-        if pid == 0:
+        sg_pid = sg_w = sg_r = None
+        sg_root_loaded = ""
+        sg_live_cpu = 0.0
+
+    def _spawn_sg(sg_root: str) -> bool:
+        nonlocal sg_pid, sg_w, sg_r, sg_root_loaded, sg_live_cpu
+        _close_sg()
+        c_in_r, c_in_w = os.pipe()
+        c_out_r, c_out_w = os.pipe()
+        spid = os.fork()
+        if spid == 0:
             try:
-                os.setsid()
+                os.close(c_in_w)
+                os.close(c_out_r)
                 proto_out.close()
-                cwd = req["cwd"]
-                os.chdir(cwd)
-                os.environ["PYTHONPATH"] = os.pathsep.join([cwd, base_pypath])
-                sys.path.insert(0, cwd)
-                mode = req["mode"]
-                if mode == "world":
-                    _execute_mode(mode, req["values"], None)
-                else:
-                    with open(req["out"], "w", buffering=1, encoding="utf-8") as fh:
-                        _execute_mode(mode, req["values"], fh)
-                        fh.flush()
+                in_f = os.fdopen(c_in_r, "r", encoding="utf-8")
+                out_f = os.fdopen(c_out_w, "w", buffering=1, encoding="utf-8")
+                sys.path.insert(0, sg_root)
+                import importlib as _imp
+                import sqlglot  # noqa: F401
+                if sys.path and sys.path[0] == sg_root:
+                    sys.path.pop(0)
+                sg_pkgs = [
+                    (name, mod)
+                    for name, mod in list(sys.modules.items())
+                    if (name == "sqlglot" or name.startswith("sqlglot.")) and hasattr(mod, "__path__")
+                ]
+                out_f.write("OK\n")
+                out_f.flush()
+                for raw in in_f:
+                    if not raw.strip():
+                        continue
+                    r = json.loads(raw)
+                    gpid = os.fork()
+                    if gpid == 0:
+                        try:
+                            os.setsid()
+                            in_f.close()
+                            out_f.close()
+                            cwd = r["cwd"]
+                            os.chdir(cwd)
+                            os.environ["PYTHONPATH"] = os.pathsep.join([cwd, base_pypath])
+                            sys.path.insert(0, cwd)
+                            for pname, pmod in sg_pkgs:
+                                sub = os.path.join(cwd, *pname.split("."))
+                                if os.path.isdir(sub):
+                                    pmod.__path__.insert(0, sub)
+                                    spec = getattr(pmod, "__spec__", None)
+                                    locs = getattr(spec, "submodule_search_locations", None)
+                                    if locs is not None and locs is not pmod.__path__:
+                                        locs.insert(0, sub)
+                            _imp.invalidate_caches()
+                            with open(r["out"], "w", buffering=1, encoding="utf-8") as fh:
+                                _execute_mode(r["mode"], r["values"], fh)
+                                fh.flush()
+                        except BaseException:
+                            pass
+                        finally:
+                            os._exit(0)
+                    out_f.write(json.dumps({"pid": gpid}) + "\n")
+                    out_f.flush()
+                    try:
+                        _, st = os.waitpid(gpid, 0)
+                    except ChildProcessError:
+                        st = -1
+                    ra = resource.getrusage(resource.RUSAGE_SELF)
+                    rb = resource.getrusage(resource.RUSAGE_CHILDREN)
+                    scpu = ra.ru_utime + ra.ru_stime + rb.ru_utime + rb.ru_stime
+                    out_f.write(json.dumps({"done": st, "cpu": round(scpu, 4)}) + "\n")
+                    out_f.flush()
             except BaseException:
                 pass
             finally:
                 os._exit(0)
-        proto_out.write(json.dumps({"pid": pid}) + "\n")
-        proto_out.flush()
-        try:
-            _, status = os.waitpid(pid, 0)
-        except ChildProcessError:
-            status = -1
-        import resource
-        r1, r2 = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
-        zcpu = r1.ru_utime + r1.ru_stime + r2.ru_utime + r2.ru_stime
-        proto_out.write(json.dumps({"done": status, "cpu": round(zcpu, 4)}) + "\n")
-        proto_out.flush()
+        os.close(c_in_r)
+        os.close(c_out_w)
+        sg_pid = spid
+        sg_w = os.fdopen(c_in_w, "w", buffering=1, encoding="utf-8")
+        sg_r = os.fdopen(c_out_r, "r", encoding="utf-8")
+        sg_root_loaded = sg_root
+        sg_live_cpu = 0.0
+        ready_line = sg_r.readline()
+        if ready_line.strip() != "OK":
+            _close_sg()
+            return False
+        return True
+
+    proto_out.write("READY\n")
+    proto_out.flush()
+
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            req = json.loads(line)
+            if kind != "world" and req.get("heavy") and not heavy_loaded:
+                try:
+                    import numpy  # noqa: F401
+                    import pandas  # noqa: F401
+                    import duckdb  # noqa: F401
+                except Exception:
+                    pass
+                heavy_loaded = True
+                if sg_pid is not None:
+                    _close_sg()
+            if kind != "world" and req.get("preimport_sg") and req.get("sg_root"):
+                if sg_pid is not None and sg_root_loaded != req["sg_root"]:
+                    _close_sg()
+                if sg_pid is None:
+                    _spawn_sg(req["sg_root"])
+                if sg_pid is not None and sg_w is not None and sg_r is not None:
+                    sent_pid = False
+                    try:
+                        sg_w.write(line if line.endswith("\n") else line + "\n")
+                        sg_w.flush()
+                        pid_msg = sg_r.readline()
+                        if pid_msg:
+                            proto_out.write(pid_msg)
+                            proto_out.flush()
+                            sent_pid = True
+                            done_msg = sg_r.readline()
+                            if done_msg:
+                                d = json.loads(done_msg)
+                                sg_live_cpu = float(d.get("cpu", sg_live_cpu))
+                                r1 = resource.getrusage(resource.RUSAGE_SELF)
+                                r2 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                                zcpu = r1.ru_utime + r1.ru_stime + r2.ru_utime + r2.ru_stime + sg_live_cpu
+                                proto_out.write(json.dumps({"done": d.get("done", -1), "cpu": round(zcpu, 4)}) + "\n")
+                                proto_out.flush()
+                                continue
+                    except Exception:
+                        pass
+                    _close_sg()
+                    if sent_pid:
+                        r1 = resource.getrusage(resource.RUSAGE_SELF)
+                        r2 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                        zcpu = r1.ru_utime + r1.ru_stime + r2.ru_utime + r2.ru_stime
+                        proto_out.write(json.dumps({"done": -1, "cpu": round(zcpu, 4)}) + "\n")
+                        proto_out.flush()
+                        continue
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.setsid()
+                    proto_out.close()
+                    if sg_w is not None:
+                        sg_w.close()
+                    if sg_r is not None:
+                        sg_r.close()
+                    cwd = req["cwd"]
+                    os.chdir(cwd)
+                    os.environ["PYTHONPATH"] = os.pathsep.join([cwd, base_pypath])
+                    sys.path.insert(0, cwd)
+                    mode = req["mode"]
+                    if mode == "world":
+                        _execute_mode(mode, req["values"], None)
+                    else:
+                        with open(req["out"], "w", buffering=1, encoding="utf-8") as fh:
+                            _execute_mode(mode, req["values"], fh)
+                            fh.flush()
+                except BaseException:
+                    pass
+                finally:
+                    os._exit(0)
+            proto_out.write(json.dumps({"pid": pid}) + "\n")
+            proto_out.flush()
+            try:
+                _, status = os.waitpid(pid, 0)
+            except ChildProcessError:
+                status = -1
+            r1, r2 = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+            zcpu = r1.ru_utime + r1.ru_stime + r2.ru_utime + r2.ru_stime + sg_live_cpu
+            proto_out.write(json.dumps({"done": status, "cpu": round(zcpu, 4)}) + "\n")
+            proto_out.flush()
+    finally:
+        _close_sg()
 
 
 def _run() -> None:

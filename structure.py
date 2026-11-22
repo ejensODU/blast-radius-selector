@@ -669,8 +669,10 @@ def resolve(text, index, root, probes=True):
                     and path.startswith("tests/") and path.endswith(".py")
                     and path not in _SHARED_TEST_FILES):
                 LAST_UNAPPLIED_TEST_FILES.add(path)
-            elif (section.status in ("delete", "rename", "add") or section.binary
-                    or path.startswith(("sqlglot/", "tests/"))):
-                LAST_UNAPPLIED = True
+            elif (value != 0 or path.startswith(("sqlglot/", "tests/"))
+                    or path.endswith((".py", ".sql", ".csv", ".gz", ".json", ".toml", ".cfg", ".ini"))):
+                if (section.status in ("delete", "rename", "add") or section.binary
+                        or path.startswith(("sqlglot/", "tests/"))):
+                    LAST_UNAPPLIED = True
             mask |= value
     return "".join(plain), mask

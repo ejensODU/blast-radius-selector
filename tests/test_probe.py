@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from probe import COMPLETE, _multiple_setups, _overlay, probe
+from probe import COMPLETE, _multiple_setups, _overlay, can_preimport_sqlglot, probe
 
 
 class ProbeTests(unittest.TestCase):
@@ -150,3 +150,13 @@ class ProbeTests(unittest.TestCase):
             )
             self.assertEqual(passed, {ok_id})
             self.assertTrue(bool(COMPLETE))
+
+    def test_can_preimport_sqlglot_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sqlglot").mkdir()
+            (root / "sqlglot" / "__init__.py").write_text("")
+            self.assertTrue(can_preimport_sqlglot(root, {"sqlglot/dialects/snowflake.py": "X = 1\n"}))
+            self.assertTrue(can_preimport_sqlglot(root, {"sqlglot/optimizer/qualify.py": "X = 1\n"}))
+            self.assertFalse(can_preimport_sqlglot(root, {"sqlglot/parser.py": "X = 1\n"}))
+            self.assertFalse(can_preimport_sqlglot(root, {"tests/test_parser.py": "X = 1\n"}))

@@ -101,17 +101,20 @@ class ObservationTests(unittest.TestCase):
         self.assertFalse(interpreted("Lt", boundary))
         self.assertTrue(interpreted("LtE", boundary))
 
-    def test_nested_compare_scopes_skip_refinement(self):
-        source = "class Box:\n    def __eq__(self, other):\n        return other is None\n"
+    def test_nested_observe_records_inner_comparison(self):
+        from values import OperandRecorder
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "m.py").write_text(source)
-            diff = patch("m.py", source, source.replace("is None", "is not None"))
-            item, = analyze(diff, root)
-            fp, = parse_patch(diff)
-            self.assertIsNone(refine(item, root, fp, {"ids": ["t1"]}, profile={"ids": ["t1"]}))
-            dialect_item = dataclasses.replace(item, scope=("_Dialect", "helper"))
-            self.assertIsNone(refine(dialect_item, root, fp, {"ids": ["t1"]}, profile={"ids": ["t1"]}))
+            rec = OperandRecorder(Path(tmp))
+            rec.sites = [("a.py", 1, 0), ("a.py", 2, 0)]
+            rec.active = True
+
+            class Inner:
+                def __eq__(self, other):
+                    return rec.observe(1, "Is", other, None)
+
+            rec.observe(0, "Eq", Inner(), object())
+            sites_seen = {s for s, _ in rec.current}
+            self.assertEqual(sites_seen, {0, 1})
 
 
 if __name__ == "__main__":

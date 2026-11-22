@@ -84,8 +84,17 @@ class SelectionTests(unittest.TestCase):
         profile = {"ids": [TPC_CDS], "incomplete": 0, "lines": {}, "reads": {},
                    "startup": {}, "startup_body": {}, "names": {}, "classes": {}, "startup_names": set()}
         idx = TestIndex(rows, profile)
-        p1 = {"tpcds": [{}], "row_exec_lines": {"sqlglot/helper.py": [381]}}
+        p1 = {"tpcds": [{}], "row_exec_lines": {"sqlglot/helper.py": [381], "sqlglot/planner.py": [23]}}
+        # planner.py row-exec line or world change is blocked; body outside row-exec uses _plan_fp
         self.assertFalse(_phase1_safe(
+            TPC_CDS, "tpcds", [Impact("sqlglot/planner.py", "body", frozenset({23}))],
+            set(), None, [], [], False, True, idx, self.root, p1,
+        ))
+        self.assertFalse(_phase1_safe(
+            TPC_CDS, "tpcds", [Impact("sqlglot/planner.py", "binding", frozenset({10}))],
+            {"sqlglot/planner.py"}, 1, [("sqlglot/planner.py", "Step", "X")], [], False, True, idx, self.root, p1,
+        ))
+        self.assertTrue(_phase1_safe(
             TPC_CDS, "tpcds", [Impact("sqlglot/planner.py", "body", frozenset({282}))],
             set(), None, [], [], False, True, idx, self.root, p1,
         ))
