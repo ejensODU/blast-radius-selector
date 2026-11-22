@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from probe import _multiple_setups, _overlay
+from probe import COMPLETE, _multiple_setups, _overlay, probe
 
 
 class ProbeTests(unittest.TestCase):
@@ -56,3 +56,20 @@ class ProbeTests(unittest.TestCase):
             first = ["a.py::A::test_one", "a.py::A::test_two"]
             self.assertFalse(_multiple_setups(root, first + ["a.py::B::test_three"]))
             self.assertTrue(_multiple_setups(root, first + ["b.py::C::test_three"]))
+
+    def test_subtest_error_does_not_discard_sibling_passes_or_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "t.py").write_text(
+                "import unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_ok(self): self.assertEqual(1, 1)\n"
+                "    def test_suberr(self):\n"
+                "        for i in range(3):\n"
+                "            with self.subTest(i=i):\n"
+                "                if i == 0: raise ValueError('boom')\n"
+            )
+            ids = ["t.py::T::test_ok", "t.py::T::test_suberr"]
+            passed = probe(root, {"x.py": "X = 1\n"}, ids, timeout=10.0, failfast_subtest=True)
+            self.assertEqual(passed, {"t.py::T::test_ok"})
+            self.assertTrue(bool(COMPLETE))

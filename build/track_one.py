@@ -1,4 +1,4 @@
-"""Run one test in this fresh interpreter with read tracking; write what it read."""
+"""Run one test in this fresh interpreter with read tracking (v2: dict + set + frozenset + scalar class attrs)."""
 import concurrent.futures as futures
 import importlib
 import json
@@ -13,11 +13,11 @@ os.chdir(root)
 os.environ["SKIP_INTEGRATION"] = "0"
 sys.path.insert(0, root)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/app")
 import track
 from worldfp import keytok
 
 track.install(root)
-
 
 POOL_USED = []
 
@@ -62,7 +62,12 @@ for cell, key in track.READS:
 prefix = root.rstrip("/") + "/"
 imports = sorted({m.__file__[len(prefix):] for name, m in list(sys.modules.items())
                   if (name == "sqlglot" or name.startswith("sqlglot.")) and (getattr(m, "__file__", None) or "").startswith(prefix)})
-json.dump({"id": nodeid, "outcome": outcome, "detail": detail, "seconds": round(time.time() - started, 3),
-           "cells": [list(c) for c in track.CELLS], "reads": {str(c): sorted(v) for c, v in reads.items()},
-           "bulk": sorted(track.BULK), "pool": bool(POOL_USED), "aliases": track.ALIASES, "stale": track.STALE, "imports": imports},
-          open(dest, "w"))
+json.dump({
+    "id": nodeid, "outcome": outcome, "detail": detail, "seconds": round(time.time() - started, 3),
+    "cells": [list(c) for c in track.CELLS],
+    "reads": {str(c): sorted(v) for c, v in reads.items()},
+    "bulk": sorted(track.BULK),
+    "attr_cells": [list(c) for c in track.ATTR_CELLS],
+    "attr_reads": sorted(track.ATTR_READS),
+    "pool": bool(POOL_USED), "aliases": track.ALIASES, "stale": track.STALE, "imports": imports,
+}, open(dest, "w"))

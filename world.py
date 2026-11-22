@@ -44,7 +44,10 @@ def _module_name(path: str) -> str:
 
 
 def _snapshot(root: Path, changes: dict[str, str], names: list[str], timeout: float):
-    from probe import _overlay
+    from probe import _overlay, probe_world
+    snap = probe_world(root, changes, names, timeout)
+    if snap is not None:
+        return snap
     try:
         with tempfile.TemporaryDirectory(prefix="world-") as directory:
             shadow = Path(directory, "tree")
@@ -126,6 +129,7 @@ def candidates(
         return None  # fingerprints from a different interpreter build cannot be compared
     line_maps, name_masks, classes = profile["lines"], profile["names"], profile["classes"]
     imports, reads, wrapped, alias = keys["imports"], keys["reads"], keys["wrapped"], keys["alias"]
+    attr_reads, attr_wrapped = keys.get("attr_reads", {}), keys.get("attr_wrapped", ())
     mask = 0
 
     failed_paths = set()
@@ -174,6 +178,9 @@ def candidates(
             for value in row.values():
                 mask |= value
             mask |= attr_mask
+            continue
+        if cell in old and cell in attr_wrapped:
+            mask |= attr_reads.get(cell, 0)
             continue
         if path not in spans:
             try:
