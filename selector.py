@@ -372,7 +372,13 @@ _OPT_ONLY_FILES = frozenset({
 })
 
 
+LAST = {}
+
+
 def select(text, root, index, probe_budget, debug=False, probes=True):
+    LAST.clear()
+    LAST.update(test_code=False, full_probed=False, tpcds_reason=0,
+                cpu_stepA=0.0, cpu_stepBC=0.0, cpu_BC_fail=0.0, cascade=False)
     # Added, deleted, renamed and unread files, and reshaped test modules, are
     # answered from recorded file and line dependencies; the rest goes on below.
     if not text.strip():
@@ -470,6 +476,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     fragile = any(breaks_pool(item, effective_world_paths) for item in impacts)
     test_code = any(item.path.startswith("tests/") and item.path.endswith(".py")
                     and item.kind not in ("equivalent", "docstring") for item in impacts)
+    LAST["test_code"] = bool(test_code)
+    LAST["probe_eligible"] = bool(probe_eligible)
     setup_safe = _setup_safe(impacts, effective_world_paths, world_mask, world_changed, world_failed, test_code)
     fixture_edited_tpcds = any(item.kind == "fixture" and item.path.startswith("tests/fixtures/optimizer/tpc-ds/") for item in impacts)
     fixture_edited_tpch = any(item.kind == "fixture" and item.path.startswith("tests/fixtures/optimizer/tpc-h/") for item in impacts)
@@ -478,6 +486,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     number = lambda keys: [index.row[key]["number"] for key in keys]
 
     # Step A: Decide the expensive executor TPC tests via Phase-1 dry-run and/or lazy slices.
+    _t_stepA = _cpu()
     slices_data = _load_slices()
     p1_data = _load_phase1()
     decided_tpc = set()
@@ -550,6 +559,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                         nominal_ms = sum(weights[index.row[k]["number"]] for k in ids)
                     elif verdict == "fail":
                         decided_tpc.add(test)
+                        if test == TPC_CDS:
+                            LAST["tpcds_reason"] = 1
                     elif verdict == "diff":
                         decided_tpc.add(test)
                         kind, entry, exp_list, _ = p1_meta[test]
@@ -584,6 +595,14 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                                 if sv is True:
                                     ids = [k for k in ids if k != test]
                                     nominal_ms = sum(weights[index.row[k]["number"]] for k in ids)
+                                elif test == TPC_CDS:
+                                    LAST["tpcds_reason"] = 1 if sv is False else 3
+                            elif test == TPC_CDS:
+                                LAST["tpcds_reason"] = 2
+                        elif test == TPC_CDS:
+                            LAST["tpcds_reason"] = 3
+                    elif test == TPC_CDS:
+                        LAST["tpcds_reason"] = 3
 
     # Fallback slice probes for TPC tests not handled by Phase-1 (e.g. edits inside executor/row-exec lines)
     for test, entry in slices_data.items():
@@ -628,6 +647,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         if verdict is True:
             ids = [key for key in ids if key != test]
             nominal_ms = sum(weights[index.row[key]["number"]] for key in ids)
+        elif test == TPC_CDS:
+            LAST["tpcds_reason"] = 1 if verdict is False else 3
 
     # Step A2: Decide heavy fixture-driven TestOptimizer tests (test_tpcds, test_tpch) via fail-fast slices.
     opt_slices_data = _load_opt_slices()
@@ -675,6 +696,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         elif verdict is False and not fragile:
             known_fail.add(test)
 
+    LAST["cpu_stepA"] = _cpu() - _t_stepA
+
     chosen = set(ids)
     cascade = []
     if fragile:
@@ -701,12 +724,18 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         if changes:
             ids.sort(key=lambda key: index.row[key]["number"])
             deadline = min(probe_budget, 3.0 + 3.5 * cpu_ms / 1000)
+            _tb = _cpu()
             passing = probe(root, changes, ids, deadline, skip_executor_setup=skip_exec_setup,
                             failfast_subtest=(not fragile))
+            _dtb = _cpu() - _tb
+            LAST["cpu_stepBC"] += _dtb
             probed = bool(COMPLETE)
             broken_users.update(BROKEN)
             full_probed = True
+            LAST["full_probed"] = True
             ids = [key for key in ids if key not in passing]
+            if ids:
+                LAST["cpu_BC_fail"] += _dtb
 
     # Step C: Selective probing when full probe did not run.
     if not full_probed and probes and ids and probe_budget > 2.0 and python_edit and explained and not test_code:
@@ -729,7 +758,12 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                     changes = changes or patch_sources(text, root)
                     if changes:
                         hit_users.sort(key=lambda key: index.row[key]["number"])
+                        _tc = _cpu()
                         passing = probe(root, changes, hit_users, min(probe_budget, 3.0 + 3.5 * hit_cpu / 1000), skip_executor_setup=True)
+                        _dtc = _cpu() - _tc
+                        LAST["cpu_stepBC"] += _dtc
+                        if any(k not in passing for k in hit_users):
+                            LAST["cpu_BC_fail"] += _dtc
                         probed = bool(COMPLETE)
                         broken_users.update(BROKEN)
                         ids = [key for key in ids if key not in passing]
@@ -761,8 +795,13 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 from probe import BROKEN, probe
                 changes = changes or patch_sources(text, root)
                 if changes:
+                    _tc = _cpu()
                     passing = probe(root, changes, sub, min(probe_budget, 3.0 + 3.5 * sub_cpu / 1000),
                                     skip_executor_setup=setup_safe, failfast_subtest=(not fragile))
+                    _dtc = _cpu() - _tc
+                    LAST["cpu_stepBC"] += _dtc
+                    if any(k not in passing for k in sub):
+                        LAST["cpu_BC_fail"] += _dtc
                     broken_users.update(BROKEN)
                     ids = [key for key in ids if key not in passing]
                     base_cost = plan_cost(schedule(number(ids), weights), weights)
@@ -792,8 +831,13 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                     changes = changes or patch_sources(text, root)
                     if changes:
                         sub.sort(key=lambda key: index.row[key]["number"])
+                        _tc = _cpu()
                         passing = probe(root, changes, sub, min(probe_budget, 3.0 + 3.5 * sub_cpu / 1000),
                                         skip_executor_setup=sub_skip, failfast_subtest=(not fragile))
+                        _dtc = _cpu() - _tc
+                        LAST["cpu_stepBC"] += _dtc
+                        if any(k not in passing for k in sub):
+                            LAST["cpu_BC_fail"] += _dtc
                         broken_users.update(BROKEN)
                         ids = [key for key in ids if key not in passing]
 
@@ -807,7 +851,10 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 hit = [key for key in users if key in chosen]
                 first = hit[0] if hit else None
             if first is not None:
-                ids.extend(key for key in users[users.index(first) + 1:] if key not in chosen)
+                added = [key for key in users[users.index(first) + 1:] if key not in chosen]
+                if added:
+                    LAST["cascade"] = True
+                    ids.extend(added)
     if extra:
         chosen = set(ids)
         ids.extend(key for key in index.selected_ids(extra) if key not in chosen)
