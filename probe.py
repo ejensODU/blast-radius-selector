@@ -380,6 +380,7 @@ def probe(
     skip_executor_setup: bool = False,
     failfast_subtest: bool = False,
     fixture_slices: dict[str, dict] | None = None,
+    per_test_caps: dict[str, float] | None = None,
 ) -> set[str]:
     """Confirm ordinary unittest methods. Exclude pytest-specific setup and marks."""
     if any(
@@ -402,6 +403,8 @@ def probe(
     }
     if fixture_slices:
         payload["fixture_slices"] = fixture_slices
+    if per_test_caps:
+        payload["per_test_caps"] = per_test_caps
     for record in _invoke(root, changes, payload, timeout, "tests", heavy=heavy):
         if isinstance(record, list):
             passed.update(wanted.intersection(record))
@@ -547,6 +550,10 @@ def _install_pool() -> None:
 
 
 class _StopSub(BaseException):
+    pass
+
+
+class _TestTimeout(KeyboardInterrupt):
     pass
 
 
@@ -967,12 +974,19 @@ def _execute_mode(mode: str, values, out) -> None:
     skip_executor_setup = False
     failfast_subtest = False
     fixture_slices = {}
+    per_test_caps = {}
     if isinstance(values, dict):
         skip_executor_setup = bool(values.get("skip_executor_setup"))
         failfast_subtest = bool(values.get("failfast_subtest"))
         fixture_slices = values.get("fixture_slices") or {}
+        per_test_caps = values.get("per_test_caps") or {}
         values = values.get("ids", [])
     LAZY = bool(failfast_subtest)
+    use_itimer = bool(failfast_subtest and per_test_caps and hasattr(signal, "setitimer"))
+    if use_itimer:
+        def _on_prof(_signum, _frame):
+            raise _TestTimeout()
+        signal.signal(signal.SIGPROF, _on_prof)
     for node in values:
         parts = node.split("::")
         if len(parts) == 3 and parts[0].endswith(".py"):
@@ -1032,10 +1046,19 @@ def _execute_mode(mode: str, values, out) -> None:
                 if (failfast_subtest and fixture_slices)
                 else {}
             )
+            cap_by_method = (
+                {m: float(per_test_caps[node]) for m, node in methods if node in per_test_caps}
+                if use_itimer
+                else {}
+            )
+            result = Result()
             if failfast_subtest:
                 orig_call = cls._callTestMethod
-                def _wrapped_call(self, method, _orig=orig_call, _sbm=slice_by_method, _mod=module):
+                def _wrapped_call(self, method, _orig=orig_call, _sbm=slice_by_method,
+                                  _cbm=cap_by_method, _mod=module, _res=result):
                     spec = _sbm.get(self._testMethodName)
+                    cap = _cbm.get(self._testMethodName, 0.0)
+                    orig_loader = None
                     if spec is not None and hasattr(_mod, "load_sql_fixture_pairs"):
                         orig_loader = _mod.load_sql_fixture_pairs
                         rel, idxs, sz = spec["rel"], spec["indices"], spec["size"]
@@ -1047,18 +1070,24 @@ def _execute_mode(mode: str, values, out) -> None:
                                 raise RuntimeError("fixture list changed length")
                             return iter([all_pairs[i] for i in _idxs])
                         _mod.load_sql_fixture_pairs = _sliced_loader
-                        try:
-                            return _orig(self, method)
-                        except _StopSub:
-                            return None
-                        finally:
-                            _mod.load_sql_fixture_pairs = orig_loader
                     try:
-                        return _orig(self, method)
+                        if cap > 0:
+                            signal.setitimer(signal.ITIMER_PROF, cap)
+                        res = _orig(self, method)
+                        if cap > 0:
+                            signal.setitimer(signal.ITIMER_PROF, 0)
+                        return res
                     except _StopSub:
                         return None
+                    except _TestTimeout:
+                        _res.aborted.add(self)
+                        return None
+                    finally:
+                        if cap > 0:
+                            signal.setitimer(signal.ITIMER_PROF, 0)
+                        if orig_loader is not None:
+                            _mod.load_sql_fixture_pairs = orig_loader
                 cls._callTestMethod = _wrapped_call
-            result = Result()
             unittest.TestSuite(list(cases)).run(result)
             # unittest represents module/class fixture errors with _ErrorHolder,
             # while subTest exceptions use _SubTest with .test_case pointing to the TestCase.

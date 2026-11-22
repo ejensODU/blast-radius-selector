@@ -127,3 +127,26 @@ class ProbeTests(unittest.TestCase):
                 fixture_slices={nid: {"rel": "target.sql", "indices": [0], "size": 2}},
             )
             self.assertEqual(passed_bad, set())
+
+    def test_per_test_cpu_cap_aborts_hang_and_keeps_sibling_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "t.py").write_text(
+                "import unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_a_hang(self):\n"
+                "        with self.subTest(i=0):\n"
+                "            x = 0\n"
+                "            while True:\n"
+                "                x += 1\n"
+                "    def test_b_ok(self):\n"
+                "        self.assertEqual(2 + 2, 4)\n"
+            )
+            hang_id = "t.py::T::test_a_hang"
+            ok_id = "t.py::T::test_b_ok"
+            passed = probe(
+                root, {"x.py": "X = 1\n"}, [hang_id, ok_id], timeout=10.0,
+                failfast_subtest=True, per_test_caps={hang_id: 0.25, ok_id: 2.0},
+            )
+            self.assertEqual(passed, {ok_id})
+            self.assertTrue(bool(COMPLETE))

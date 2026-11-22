@@ -27,6 +27,7 @@ LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 LAST_CHANGED: list[tuple[str, str, str]] = []
 LAST_FAILED: list[str] = []
 LAST_PURE_BODY: bool = False
+LAST_FN_SPANS: list[tuple[str, tuple[int, int]]] | None = None
 
 
 @lru_cache(maxsize=1)
@@ -36,6 +37,67 @@ def _data():
     with gzip.open(APP / "keyreads.pkl.gz", "rb") as f:
         keys = pickle.load(f)
     return world, keys
+
+
+@lru_cache(maxsize=1)
+def _dispatch_maps():
+    _, keys = _data()
+    by_tok: dict[str, int] = {}
+    by_lower: dict[str, int] = {}
+    for cell, row in keys.get("reads", {}).items():
+        if isinstance(cell, tuple) and len(cell) == 3 and cell[0] == "<derived>" and cell[2] == "dispatch":
+            for tok, m in row.items():
+                by_tok[tok] = by_tok.get(tok, 0) | m
+                if isinstance(tok, str) and tok.startswith("c:"):
+                    short = tok.rsplit(".", 1)[-1].lower()
+                    by_lower[short] = by_lower.get(short, 0) | m
+    return by_tok, by_lower
+
+
+@lru_cache(maxsize=2)
+def _test_imports(root_str: str):
+    """Map (source_path, attr) -> set of test file relative paths doing `from mod import attr`."""
+    root = Path(root_str)
+    tests_dir = root / "tests"
+    attr_imp: dict[tuple[str, str], set[str]] = {}
+    star_imp: dict[str, set[str]] = {}
+    if not tests_dir.is_dir():
+        return attr_imp, star_imp
+    for path in tests_dir.rglob("*.py"):
+        rel = path.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                base = node.module.replace(".", "/")
+                cands = (base + ".py", base + "/__init__.py")
+                for alias in node.names:
+                    for cand in cands:
+                        if alias.name == "*":
+                            star_imp.setdefault(cand, set()).add(rel)
+                        else:
+                            attr_imp.setdefault((cand, alias.name), set()).add(rel)
+    return attr_imp, star_imp
+
+
+def _import_break_mask(path: str, attr: str, index, root: Path) -> int:
+    attr_imp, star_imp = _test_imports(str(root.resolve()))
+    tfiles = attr_imp.get((path, attr), set()) | star_imp.get(path, set())
+    if not tfiles:
+        return 0
+    line_maps = index.profile["lines"]
+    reads = index.profile["reads"]
+    mask = 0
+    for tf in tfiles:
+        if tf in {"tests/helpers.py", "tests/dialects/test_dialect.py", "tests/__init__.py"}:
+            return index.full
+        m = index.by_file.get(tf, 0) | reads.get(tf, 0)
+        for lmask in line_maps.get(tf, {}).values():
+            m |= lmask
+        mask |= m or index.full
+    return mask
 
 
 def _module_name(path: str) -> str:
@@ -104,11 +166,13 @@ def candidates(
     allow_new: bool = False,
 ):
     """A test mask, or None when this analysis cannot vouch for the patch."""
-    global LAST_PURE_BODY
+    global LAST_PURE_BODY, LAST_FN_SPANS
     LAST_CHANGED.clear()
     LAST_FAILED.clear()
     LAST_PURE_BODY = False
+    LAST_FN_SPANS = None
     world, keys = _data()
+    dispatch_by_tok, dispatch_by_lower = _dispatch_maps()
     profile = index.profile
     if keys["ids"] != profile["ids"]:
         return None
@@ -148,9 +212,22 @@ def candidates(
     touched = set()
     spans = {}
     derived = False
+    fn_spans: list[tuple[str, tuple[int, int]]] = []
+    all_fn_spans = True
     for cell in set(old) | set(new):
         path, qual, attr = cell
-        if path not in scope or path in failed_paths or path in new_paths or cell in world["unstable"] or old.get(cell) == new.get(cell):
+        if path not in scope or path in failed_paths or path in new_paths:
+            continue
+        if cell in world["unstable"]:
+            if path in changes:
+                derived = True
+                all_fn_spans = False
+                LAST_CHANGED.append(cell)
+                touched.add(path)
+                mod_imp = imports.get(path, 0)
+                mask |= (name_masks.get(attr, 0) & mod_imp) or mod_imp
+            continue
+        if old.get(cell) == new.get(cell):
             continue
         if body_cells and cell in body_cells and cell in old and cell in new:
             continue  # plain function-body edit handled by line coverage + operand refinement
@@ -159,6 +236,8 @@ def candidates(
         touched.add(path)
         if attr == "<bases>":
             return None
+        if cell in old and cell not in new and not qual:
+            mask |= _import_break_mask(path, attr, index, root)
         target = alias.get(cell, cell)
         row = reads.get(target, {})
         mod_imp = imports.get(path, 0)
@@ -168,18 +247,23 @@ def candidates(
             if owners is not None:
                 attr_mask &= owners | name_masks.get(qual.rpartition(".")[2], 0)
         if target in wrapped and cell in old_parts and cell in new_parts:
+            all_fn_spans = False
             before, after = old_parts[cell], new_parts[cell]
             mask |= row.get("*", 0)
             for tok in set(before) | set(after):
                 if before.get(tok) != after.get(tok):
                     mask |= row.get(tok, 0)
+                    if attr == "TRANSFORMS":
+                        mask |= dispatch_by_tok.get(tok, 0) & mod_imp
             continue
         if target in wrapped:
+            all_fn_spans = False
             for value in row.values():
                 mask |= value
             mask |= attr_mask
             continue
         if cell in old and cell in attr_wrapped:
+            all_fn_spans = False
             mask |= attr_reads.get(cell, 0)
             continue
         if path not in spans:
@@ -188,12 +272,20 @@ def candidates(
             except OSError:
                 spans[path] = {}
         span = spans[path].get(f"{qual}.{attr}" if qual else attr)
-        if span is not None and cell in old and cell in new:
+        if qual and attr.endswith("_sql") and (cell not in old or cell not in new or span is None):
+            dmask = dispatch_by_lower.get(attr[:-4].lower(), 0)
+            mask |= (dmask & mod_imp) if dmask else mod_imp
+        if span is not None and cell in old:
             hits = line_maps.get(path, {})
             for line in range(span[0], span[1] + 1):
                 mask |= hits.get(line, 0)
-            continue
+            if cell in new:
+                fn_spans.append((path, span))
+                continue
+        all_fn_spans = False
         mask |= attr_mask
+    if derived and all_fn_spans and fn_spans and not failed_paths:
+        LAST_FN_SPANS = fn_spans
     if body_cells and not derived and not failed_paths:
         LAST_PURE_BODY = True
     for path in touched | failed_paths:

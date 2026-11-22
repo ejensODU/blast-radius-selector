@@ -342,7 +342,11 @@ def _changed_line(path, tree, executable, line, before, after):
             in_body = any(n in nodes for n in closest.body)
         if in_body:
             touched = {line}
-            if line not in executable or (after is not None and _LOGIC.findall(before) != _LOGIC.findall(after)):
+            if isinstance(stmt, (ast.Nonlocal, ast.Global)):
+                outer_fn = next(n for n in scopes if isinstance(n, _FUNCTION))
+                outer_exec = {ln for ln in executable if outer_fn.lineno <= ln <= outer_fn.end_lineno}
+                touched.update(outer_exec or {outer_fn.lineno})
+            elif line not in executable or (after is not None and _LOGIC.findall(before) != _LOGIC.findall(after)):
                 touched.update(_header_lines(stmt))
             body = (closest.lineno, closest.end_lineno)
             return Impact(path, "body", frozenset(touched), scope=scope, function_lines=body)

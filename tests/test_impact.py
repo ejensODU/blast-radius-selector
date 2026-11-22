@@ -1,10 +1,11 @@
+import dataclasses
 import difflib
 from pathlib import Path
 import tempfile
 import unittest
 
 from impact import analyze, parse_patch
-from values import OPS, _literal_replacement, _literal_unchanged, interpreted, relation
+from values import OPS, _literal_replacement, _literal_unchanged, interpreted, refine, relation
 
 
 def patch(name, before, after):
@@ -45,6 +46,21 @@ class ImpactTests(unittest.TestCase):
             text += patch("b.py", source, source.replace("1", ")"))
             self.assertEqual([i.kind for i in analyze(text, root)], ["body", "unknown"])
 
+    def test_deleting_nonlocal_widens_to_outer_function(self):
+        source = (
+            "def outer():\n"
+            "    x = 1\n"
+            "    def inner():\n"
+            "        nonlocal x\n"
+            "        x = 2\n"
+            "    inner()\n"
+            "    return x\n"
+        )
+        changed = source.replace("        nonlocal x\n", "")
+        item, = self.inspect(source, changed)
+        self.assertEqual(item.kind, "body")
+        self.assertTrue({2, 6, 7} <= item.lines)
+
 
 class ObservationTests(unittest.TestCase):
     def test_opaque_equality_is_never_invoked(self):
@@ -84,6 +100,18 @@ class ObservationTests(unittest.TestCase):
         boundary = relation((1, 4), (1, 4))
         self.assertFalse(interpreted("Lt", boundary))
         self.assertTrue(interpreted("LtE", boundary))
+
+    def test_nested_compare_scopes_skip_refinement(self):
+        source = "class Box:\n    def __eq__(self, other):\n        return other is None\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "m.py").write_text(source)
+            diff = patch("m.py", source, source.replace("is None", "is not None"))
+            item, = analyze(diff, root)
+            fp, = parse_patch(diff)
+            self.assertIsNone(refine(item, root, fp, {"ids": ["t1"]}, profile={"ids": ["t1"]}))
+            dialect_item = dataclasses.replace(item, scope=("_Dialect", "helper"))
+            self.assertIsNone(refine(dialect_item, root, fp, {"ids": ["t1"]}, profile={"ids": ["t1"]}))
 
 
 if __name__ == "__main__":

@@ -481,9 +481,21 @@ def _literal_unchanged(op, state, old_rhs, new_rhs):
     return all(interpreted(op, (False, value)) == interpreted(op, state) for value in possible)
 
 
+_NESTED_COMPARE_SCOPES = frozenset({
+    "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__", "__hash__",
+})
+
+
 def refine(impact, source_root, filepatch, mapdata, profile=None):
     """Return tests that may observe a change to this comparison, or None."""
     if impact.kind != 'body':
+        return None
+    # Nested comparisons inside dunder comparison/hash hooks or _Dialect are suppressed
+    # during recording (observe() skips re-entrant calls while line_seen still marks the line).
+    if impact.scope and (
+        impact.scope[0] == "_Dialect"
+        or any(s in _NESTED_COMPARE_SCOPES for s in impact.scope)
+    ):
         return None
     if profile is None:
         profile = _load()

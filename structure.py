@@ -418,8 +418,9 @@ class Resolver:
             if a is not None and b is not None and ast.dump(a) == ast.dump(b):
                 continue
             if a is None:
-                # A new top-level name: harmless unless it replaces one the module already had.
-                if name in old_names:
+                # A new top-level name: harmless unless it replaces one the module already had
+                # or introduces a unittest/pytest module hook.
+                if name in old_names or name in {"setUpModule", "tearDownModule", "setup_module", "teardown_module"}:
                     return everyone
                 continue
             if type(a) is not type(b) or not isinstance(a, ast.ClassDef):
@@ -628,11 +629,26 @@ class Resolver:
         return "plain", None
 
 
+_SHARED_TEST_FILES = frozenset({
+    "tests/__init__.py",
+    "tests/helpers.py",
+    "tests/conftest.py",
+    "tests/dialects/__init__.py",
+    "tests/dialects/test_dialect.py",
+})
+
+LAST_UNAPPLIED = False
+LAST_UNAPPLIED_TEST_FILES: set[str] = set()
+
+
 def resolve(text, index, root, probes=True):
     """Split a patch into the part the ordinary analysis handles and a set of tests for the rest.
 
     Returns (plain_text, mask); mask is FULL when some section cannot be judged.
     """
+    global LAST_UNAPPLIED
+    LAST_UNAPPLIED = False
+    LAST_UNAPPLIED_TEST_FILES.clear()
     parts = sections(text)
     if parts is None:
         return text, 0
@@ -648,5 +664,13 @@ def resolve(text, index, root, probes=True):
         elif value is FULL:
             return "", FULL
         else:
+            path = section.new if section.status == "add" else (section.old or section.new or "")
+            if (section.status == "modify" and not section.binary
+                    and path.startswith("tests/") and path.endswith(".py")
+                    and path not in _SHARED_TEST_FILES):
+                LAST_UNAPPLIED_TEST_FILES.add(path)
+            elif (section.status in ("delete", "rename", "add") or section.binary
+                    or path.startswith(("sqlglot/", "tests/"))):
+                LAST_UNAPPLIED = True
             mask |= value
     return "".join(plain), mask

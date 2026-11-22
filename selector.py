@@ -24,12 +24,21 @@ TPC_SET = frozenset({TPC_CDS, TPC_H, TPC_OPT_H})
 TPC_KIND = {TPC_CDS: "tpcds", TPC_H: "tpch", TPC_OPT_H: "opt_tpch"}
 
 _ROW_EXEC_WORLD_FILES = frozenset({
+    "sqlglot/executor/__init__.py",
     "sqlglot/executor/context.py",
     "sqlglot/executor/env.py",
     "sqlglot/executor/python.py",
     "sqlglot/executor/table.py",
+    "sqlglot/planner.py",
 })
-_ROW_EXEC_HELPER_ATTRS = frozenset({"is_int", "seq_get", "PYTHON_VERSION"})
+_ROW_EXEC_HELPER_ATTRS = frozenset({"is_int", "seq_get", "PYTHON_VERSION", "dict_depth"})
+_SHARED_TEST_FILES = frozenset({
+    "tests/__init__.py",
+    "tests/helpers.py",
+    "tests/conftest.py",
+    "tests/dialects/__init__.py",
+    "tests/dialects/test_dialect.py",
+})
 _RT_FIXTURES = frozenset({
     "tests/fixtures/identity.sql",
     "tests/fixtures/pretty.sql",
@@ -143,12 +152,15 @@ class TestIndex:
             if pairs is None:
                 continue  # the class set-up itself may fail: every test of the class stays
             old_pairs, new_pairs = pairs
-            if len(old_pairs) != len(new_pairs):
-                continue
-            changed = {position for a, b in zip(old_pairs, new_pairs)
-                       for position, (x, y) in enumerate(zip(a, b)) if x != y or type(x) is not type(y)}
-            if any(len(a) != len(b) for a, b in zip(old_pairs, new_pairs)):
-                continue
+            same_shape = (
+                len(old_pairs) == len(new_pairs)
+                and not any(len(a) != len(b) for a, b in zip(old_pairs, new_pairs))
+            )
+            changed = (
+                {position for a, b in zip(old_pairs, new_pairs)
+                 for position, (x, y) in enumerate(zip(a, b)) if x != y or type(x) is not type(y)}
+                if same_shape else None
+            )
             for position, name in enumerate(self.names):
                 bit = 1 << position
                 if not reads & bit or name not in entry["touch"]:
@@ -156,7 +168,9 @@ class TestIndex:
                 if path in entry["body"].get(name, ()):
                     continue
                 used = loaders.intersection(entry["touch"][name])
-                if all(changed <= set(entry["unused"].get(name, {}).get(attr, ())) for attr in used):
+                if not used:
+                    reads &= ~bit
+                elif same_shape and all(changed <= set(entry["unused"].get(name, {}).get(attr, ())) for attr in used):
                     reads &= ~bit
         return reads
 
@@ -235,12 +249,27 @@ def _load_phase1():
     return _PHASE1
 
 
-def slice_plan(test, entry, impacts, world_paths, parts, index, root):
+def _unrelated_test_item(test, item, bit, index):
+    if not (item.path.startswith("tests/") and item.path.endswith(".py")):
+        return False
+    if item.path == test.split("::")[0] or item.path in _SHARED_TEST_FILES:
+        return False
+    if index.profile["reads"].get(item.path, 0) & bit:
+        return False
+    if any(m & bit for m in index.profile["lines"].get(item.path, {}).values()):
+        return False
+    return True
+
+
+def slice_plan(test, entry, impacts, world_paths, parts, index, root, world_fn_spans=None):
     """Elements of a fixture-driven test that the patch can reach, or None when that is not known."""
     bit = 1 << index.names.index(test)
     need = 0
+    world_checked = False
     for item in impacts:
         if item.kind in ("equivalent", "docstring"):
+            continue
+        if _unrelated_test_item(test, item, bit, index):
             continue
         if item.kind == "fixture":
             if item.path == entry["file"]:
@@ -251,10 +280,32 @@ def slice_plan(test, entry, impacts, world_paths, parts, index, root):
                     if old != new:
                         need |= 1 << position
                 continue
-            if not (index.profile["reads"].get(item.path, 0) & bit):
+            raw_reads = index.profile["reads"].get(item.path, 0)
+            if not (raw_reads & bit):
                 continue  # this test never reads that fixture file
+            if not (index.setup_readers(item.path, raw_reads, root, parts.get(item.path)) & bit):
+                continue  # only touched via an unused class set-up attribute
             return None
-        if item.kind != "body" or item.path in world_paths or not item.path.startswith("sqlglot/"):
+        if item.path in world_paths:
+            if not world_fn_spans:
+                return None
+            if not world_checked:
+                world_checked = True
+                for wp, (lo, hi) in world_fn_spans:
+                    cover = entry["lines"].get(wp, {})
+                    setup = entry["setup"].get(wp, ())
+                    outer = entry.get("outer", {}).get(wp, ())
+                    credited = index.profile["lines"].get(wp, {})
+                    for line in range(lo, hi + 1):
+                        if line in setup:
+                            return None
+                        hit = cover.get(line, cover.get(str(line), 0))
+                        if not hit and line not in outer and credited.get(line, 0) & bit:
+                            return None
+                        need |= hit
+            if item.kind != "body":
+                continue
+        if item.kind != "body" or not item.path.startswith("sqlglot/"):
             return None
         cover = entry["lines"].get(item.path, {})
         setup = entry["setup"].get(item.path, ())
@@ -290,7 +341,7 @@ def _setup_safe(impacts, world_paths, world_mask, world_changed, world_failed, t
 
 
 def _phase1_safe(test, kind, impacts, world_paths, world_mask, world_changed, world_failed,
-                 test_code, explained, index, root, p1_data):
+                 test_code, explained, index, root, p1_data, parts=None):
     """True when Phase-1 dry-run + fingerprint check is sound for this executor TPC test."""
     if test_code or not explained or not p1_data or test not in index.names:
         return False
@@ -300,26 +351,43 @@ def _phase1_safe(test, kind, impacts, world_paths, world_mask, world_changed, wo
     for item in impacts:
         if item.kind in ("equivalent", "docstring"):
             continue
+        if _unrelated_test_item(test, item, bit, index):
+            continue
         if item.kind == "fixture":
             if item.path == allowed_fixture:
                 continue
-            if not (index.profile["reads"].get(item.path, 0) & bit):
+            raw_reads = index.profile["reads"].get(item.path, 0)
+            if not (raw_reads & bit):
+                continue
+            if parts and not (index.setup_readers(item.path, raw_reads, root, parts.get(item.path)) & bit):
                 continue
             return False
         if item.path == "sqlglot/executor/table.py":
             return False
+        if item.path == "sqlglot/executor/__init__.py" and kind in ("tpcds", "tpch"):
+            return False
+        if item.path == "sqlglot/planner.py" and kind == "tpcds":
+            return False
         if item.kind == "body" and item.path not in world_paths:
-            if kind == "tpcds" and item.path in _ROW_EXEC_WORLD_FILES:
+            if kind == "tpcds":
                 rl = row_lines.get(item.path)
                 if rl and item.lines.intersection(rl):
                     return False
         elif item.path not in world_paths:
             return False
     if world_paths:
-        if world_mask is None or world_failed:
+        if world_mask is None:
             return False
+        if world_failed:
+            import world
+            _, kr = world._data()
+            imps = kr.get("imports", {})
+            if any(imps.get(fp, -1) & bit for fp in world_failed):
+                return False
         for p, q, a in world_changed:
             if p == "sqlglot/executor/table.py":
+                return False
+            if p == "sqlglot/executor/__init__.py" and kind in ("tpcds", "tpch"):
                 return False
             if kind == "tpcds":
                 if p in _ROW_EXEC_WORLD_FILES:
@@ -367,11 +435,15 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     plain, extra = structure.resolve(text, index, root, probes=probes)
     if extra is structure.FULL:
         return schedule([row["number"] for row in index.row.values()], index.durations)
+    unapplied_test_files = set()
     if plain != text:
         if debug:
             print("structural", len(index.selected_ids(extra)), "plain" if plain else "", file=sys.stderr)
         if not plain:
             return schedule([index.row[key]["number"] for key in index.selected_ids(extra)], index.durations)
+        if structure.LAST_UNAPPLIED:
+            probes = False
+        unapplied_test_files = set(structure.LAST_UNAPPLIED_TEST_FILES)
         text = plain
     impacts = analyze(text, root)
     parts = {part.path: part for part in parse_patch(text)}
@@ -396,6 +468,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     world_mask = None
     world_changed = []
     world_failed = []
+    world_fn_spans = None
     pure_body_world = False
     if world_paths and probes:
         import world
@@ -410,6 +483,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 world_mask &= index.full
                 world_changed = list(world.LAST_CHANGED)
                 world_failed = list(world.LAST_FAILED)
+                world_fn_spans = world.LAST_FN_SPANS
                 pure_body_world = bool(world.LAST_PURE_BODY and not hard_world_paths)
 
     effective_world_paths = set() if pure_body_world else world_paths
@@ -455,9 +529,15 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                     or (world_mask is not None and item.path in world_paths) for item in impacts)
     pool_safe = _pool_safe_world(world_mask, world_changed, world_failed)
     fragile = any(breaks_pool(item, effective_world_paths, pool_safe=pool_safe) for item in impacts)
-    test_code = any(item.path.startswith("tests/") and item.path.endswith(".py")
-                    and item.kind not in ("equivalent", "docstring") for item in impacts)
-    setup_safe = _setup_safe(impacts, effective_world_paths, world_mask, world_changed, world_failed, test_code)
+    edited_test_files = {item.path for item in impacts
+                         if item.path.startswith("tests/") and item.path.endswith(".py")
+                         and item.kind not in ("equivalent", "docstring")}
+    unprobeable_test_files = edited_test_files | unapplied_test_files
+    shared_test_edit = bool(unprobeable_test_files & _SHARED_TEST_FILES)
+    exec_test_code = shared_test_edit or ("tests/test_executor.py" in unprobeable_test_files)
+    opt_test_code = shared_test_edit or ("tests/test_optimizer.py" in unprobeable_test_files)
+    probe_test_block = shared_test_edit or (fragile and opt_test_code)
+    setup_safe = _setup_safe(impacts, effective_world_paths, world_mask, world_changed, world_failed, exec_test_code)
     fixture_edited_tpcds = any(item.kind == "fixture" and item.path.startswith("tests/fixtures/optimizer/tpc-ds/") for item in impacts)
     fixture_edited_tpch = any(item.kind == "fixture" and item.path.startswith("tests/fixtures/optimizer/tpc-h/") for item in impacts)
     fixture_edited_tpc = fixture_edited_tpcds or fixture_edited_tpch
@@ -469,7 +549,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     p1_data = _load_phase1()
     decided_tpc = set()
 
-    if probes and not test_code and probe_budget > 5 and any(t in ids for t in TPC_SET):
+    if probes and not exec_test_code and probe_budget > 5 and any(t in ids for t in TPC_SET):
         p1_jobs = []
         p1_meta = {}
         opt_only_edit = (
@@ -487,13 +567,13 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 continue
             kind = TPC_KIND[test]
             if not _phase1_safe(test, kind, impacts, effective_world_paths, world_mask,
-                                world_changed, world_failed, test_code, explained, index, root, p1_data):
+                                world_changed, world_failed, exec_test_code, explained, index, root, p1_data, parts=parts):
                 continue
             entry = slices_data.get(test)
             exp_list = p1_data.get(kind, [])
             if not exp_list:
                 continue
-            indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root) if entry else None
+            indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root, world_fn_spans) if entry else None
             if indices is None:
                 indices = list(range(len(exp_list)))
             if not indices:
@@ -585,9 +665,9 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
 
     # Fallback slice probes for TPC tests not handled by Phase-1 (e.g. edits inside executor/row-exec lines)
     for test, entry in slices_data.items():
-        if not probes or test in decided_tpc or test not in ids or test not in index.row or test_code or probe_budget <= 5:
+        if not probes or test in decided_tpc or test not in ids or test not in index.row or exec_test_code or probe_budget <= 5:
             continue
-        indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root)
+        indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root, world_fn_spans)
         if not indices:
             continue
         saving = (plan_cost(schedule(number(ids), weights), weights)
@@ -631,7 +711,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     opt_slices_data = _load_opt_slices()
     fixture_slices = {}
     extra_override = {}
-    if probes and ids and not fragile and not test_code and explained:
+    if probes and ids and not fragile and not opt_test_code and explained:
         if _PROBE_COST is None:
             probe_cpu_ms([], 0)
         tmap = (_PROBE_COST or {}).get("tests", {})
@@ -640,7 +720,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             entry = opt_slices_data.get(test)
             if not entry or test not in index.row:
                 continue
-            idxs = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root)
+            idxs = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root, world_fn_spans)
             if idxs is not None and len(idxs) < entry["size"]:
                 idxs.sort(key=lambda i: entry["cost"][i])
                 fixture_slices[test] = {"rel": entry["rel"], "indices": idxs, "size": entry["size"]}
@@ -652,7 +732,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
 
     # Check whether Step B will already run directly (so Step A2 doesn't duplicate a sliced test).
     stepB_ready = False
-    if probes and ids and len(ids) <= 130 and probe_budget > 0.5 and probe_eligible and explained and not test_code:
+    if probes and ids and len(ids) <= 130 and probe_budget > 0.5 and probe_eligible and explained and not probe_test_block:
         _chosen0 = set(ids)
         _casc0 = []
         if fragile:
@@ -671,11 +751,11 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     known_fail = set()
     for test in (OPT_TPCDS, OPT_TPCH):
         entry = opt_slices_data.get(test)
-        if not entry or not probes or test not in ids or test not in index.row or test_code or not explained or probe_budget <= 3:
+        if not entry or not probes or test not in ids or test not in index.row or opt_test_code or not explained or probe_budget <= 3:
             continue
         if stepB_ready and test in fixture_slices:
             continue
-        indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root)
+        indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root, world_fn_spans)
         if indices is not None and not indices:
             continue
         if indices is None:
@@ -733,11 +813,13 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 fixed_fx.update(k for k in index.selected_ids(index.profile["reads"].get(item.path, 0)) if k in chosen)
         if fragile and (fixed_fx & pool_set):
             fixed_fx.clear()
-    probe_ids = [k for k in ids if k not in fixed_fx] if fixed_fx else ids
+    fixed_tests = {k for k in ids if k.split("::")[0] in unprobeable_test_files}
+    fixed_keep = fixed_fx | fixed_tests
+    probe_ids = [k for k in ids if k not in fixed_keep] if fixed_keep else ids
     probe_nom = sum(weights[index.row[k]["number"]] for k in probe_ids)
     unprobed_ms = plan_cost(schedule(number(ids + cascade), weights), weights)
     plain_ms = plan_cost(schedule(number(ids), weights), weights)
-    fixed_ms = plan_cost(schedule(number(list(fixed_fx)), weights), weights) if fixed_fx else 0
+    fixed_ms = plan_cost(schedule(number(list(fixed_keep)), weights), weights) if fixed_keep else 0
     skip_exec_setup = setup_safe and not (set(probe_ids) & TPC_SET)
     cpu_ms = probe_cpu_ms(probe_ids, probe_nom, skip_exec_setup=skip_exec_setup, extra_override=extra_override)
     p0 = 0.45 if (world_mask is not None or roundtrip_fixture) else 0.40
@@ -745,14 +827,27 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     worth = bool(probe_ids) and (p0 * pot_saving + (1.0 - p0) * max(0.0, unprobed_ms - 0.95 * plain_ms) - cpu_ms > 0)
     if debug and ids:
         print("   probe-data " + json.dumps({"ids": number(probe_ids), "cascade": number(cascade), "cpu": round(cpu_ms),
-                                             "ok": bool(probe_eligible and explained and not test_code and len(probe_ids) <= 130),
-                                             "sliced": len(fixture_slices), "fixed": len(fixed_fx)}),
+                                             "ok": bool(probe_eligible and explained and not probe_test_block and len(probe_ids) <= 130),
+                                             "sliced": len(fixture_slices), "fixed": len(fixed_keep)}),
               file=sys.stderr)
         print(f"   probe estimate cpu={cpu_ms:.0f} unprobed={unprobed_ms} worth={worth} skip_setup={skip_exec_setup} fragile={fragile}", file=sys.stderr)
+    def _test_caps(keys):
+        if fragile:
+            return None
+        if _PROBE_COST is None:
+            probe_cpu_ms([], 0)
+        tm = (_PROBE_COST or {}).get("tests", {})
+        fm = (_PROBE_COST or {}).get("files", {})
+        caps = {}
+        for k in keys:
+            ex_ms = extra_override[k] if k in extra_override else max(0, tm.get(k, weights[index.row[k]["number"]]) - fm.get(k.split("::")[0], 0))
+            caps[k] = max(1.5, 4.0 * ex_ms / 1000.0)
+        return caps
+
     full_probed = False
     broken_users = set()
     if (probes and probe_ids and worth and len(probe_ids) <= 130 and probe_budget > 0.5 and probe_eligible and explained
-            and not test_code):
+            and not probe_test_block):
         from probe import BROKEN, COMPLETE, probe
         changes = changes or patch_sources(text, root)
         if changes:
@@ -760,14 +855,15 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             deadline = min(probe_budget, max(2.2, 1.5 + 2.8 * cpu_ms / 1000))
             sub_slices = {k: fixture_slices[k] for k in probe_ids if k in fixture_slices} if not fragile else None
             passing = probe(root, changes, probe_ids, deadline, skip_executor_setup=skip_exec_setup,
-                            failfast_subtest=(not fragile), fixture_slices=sub_slices)
+                            failfast_subtest=(not fragile), fixture_slices=sub_slices,
+                            per_test_caps=_test_caps(probe_ids))
             probed = bool(COMPLETE)
             broken_users.update(BROKEN)
             full_probed = True
             ids = [key for key in ids if key not in passing]
 
     # Step C: Selective probing when full probe did not run.
-    if not full_probed and probes and ids and probe_budget > 2.0 and python_edit and explained and not test_code:
+    if not full_probed and probes and ids and probe_budget > 2.0 and python_edit and explained and not probe_test_block:
         # C1: Settle optimizer pool cascade by probing only the hit pool users.
         if fragile and cascade:
             hit_users = []
@@ -797,7 +893,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         base_cost = plan_cost(schedule(number(ids), weights), weights)
         if len(ids) <= 250:
             for key in sorted(ids, key=lambda k: -weights[index.row[k]["number"]]):
-                if key in TPC_SET or key in fixed_fx or (fragile and key in pool_set):
+                if key in TPC_SET or key in fixed_keep or (fragile and key in pool_set):
                     continue
                 w_ms = weights[index.row[key]["number"]]
                 if w_ms < 1000:
@@ -821,13 +917,14 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 if changes:
                     sub_slices = {k: fixture_slices[k] for k in sub if k in fixture_slices} if not fragile else None
                     passing = probe(root, changes, sub, min(probe_budget, max(2.2, 1.5 + 2.8 * sub_cpu / 1000)),
-                                    skip_executor_setup=setup_safe, failfast_subtest=(not fragile), fixture_slices=sub_slices)
+                                    skip_executor_setup=setup_safe, failfast_subtest=(not fragile),
+                                    fixture_slices=sub_slices, per_test_caps=_test_caps(sub))
                     broken_users.update(BROKEN)
                     ids = [key for key in ids if key not in passing]
                     base_cost = plan_cost(schedule(number(ids), weights), weights)
         # C3: If a few expensive-to-probe tests blocked Step B, probe the cheap remainder if profitable.
         if ids and len(ids) <= 130:
-            eligible = [k for k in ids if k not in TPC_SET and k not in known_fail and k not in fixed_fx and not (fragile and k in pool_set)]
+            eligible = [k for k in ids if k not in TPC_SET and k not in known_fail and k not in fixed_keep and not (fragile and k in pool_set)]
             if len(eligible) >= 2:
                 # Sort by per-test incremental probe cost descending and peel off up to 8 heavy blockers.
                 tmap = (_PROBE_COST or {}).get("tests", {})
@@ -856,14 +953,15 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                         sub.sort(key=lambda key: index.row[key]["number"])
                         sub_slices = {k: fixture_slices[k] for k in sub if k in fixture_slices} if not fragile else None
                         passing = probe(root, changes, sub, min(probe_budget, max(2.2, 1.5 + 2.8 * sub_cpu / 1000)),
-                                        skip_executor_setup=sub_skip, failfast_subtest=(not fragile), fixture_slices=sub_slices)
+                                        skip_executor_setup=sub_skip, failfast_subtest=(not fragile),
+                                        fixture_slices=sub_slices, per_test_caps=_test_caps(sub))
                         broken_users.update(BROKEN)
                         ids = [key for key in ids if key not in passing]
 
-    if fragile and (ids or broken_users):
+    if (fragile or broken_users) and (ids or broken_users):
         chosen = set(ids)
         for users in pool_groups(index):
-            if probed:
+            if probed or not fragile:
                 breakers = [key for key in users if key in broken_users]
                 first = breakers[0] if breakers else None
             else:
