@@ -71,6 +71,13 @@ _SQLGLOT_IMPORT_FILES = frozenset({
 })
 
 
+_SQLGLOT_IMPORT_MODS = frozenset({
+    p[:-3].replace("/", ".").removesuffix(".__init__")
+    for p in _SQLGLOT_IMPORT_FILES
+})
+_WORLD_OLD_CELLS: dict | None = None
+
+
 def can_preimport_sqlglot(root: Path, changes: dict[str, str] | None, mode: str = "tests") -> bool:
     if mode not in ("tests", "phase1", "slices", "opt_slices") or not changes:
         return False
@@ -371,8 +378,14 @@ def probe_world(root: Path, changes: dict[str, str], names: list[str], timeout: 
             shadow = base / "src"
             shadow.mkdir()
             out_path = base / "snap.pkl"
-            _overlay(root.resolve(), shadow, changes)
-            if _invoke_zygote(shadow, out_path, {"names": names, "dest": str(out_path)}, timeout, "world", heavy=False):
+            resolved_root = root.resolve()
+            _overlay(resolved_root, shadow, changes)
+            pre_sg = (
+                can_preimport_sqlglot(resolved_root, changes, "tests")
+                and not any(n in _SQLGLOT_IMPORT_MODS for n in names)
+            )
+            if _invoke_zygote(shadow, out_path, {"names": names, "dest": str(out_path)}, timeout, "world",
+                              heavy=False, preimport_sg=pre_sg, sg_root=str(resolved_root)):
                 if out_path.is_file():
                     return pickle.loads(out_path.read_bytes())
                 return None
@@ -638,8 +651,19 @@ def _execute_mode(mode: str, values, out) -> None:
         dest = values["dest"]
         root = os.getcwd()
         failed = worldfp.load(names)
-        cells, parts = worldfp.snapshot(root, set(names))
-        data = {"cells": cells, "parts": parts, "failed": failed, "seed": worldfp._h(*worldfp.SEED_CHECK)}
+        if _WORLD_OLD_CELLS is not None:
+            cells, parts, removed = worldfp.snapshot(root, set(names), old_cells=_WORLD_OLD_CELLS)
+            data = {
+                "cells": cells,
+                "parts": parts,
+                "removed": removed,
+                "diff": True,
+                "failed": failed,
+                "seed": worldfp._h(*worldfp.SEED_CHECK),
+            }
+        else:
+            cells, parts = worldfp.snapshot(root, set(names))
+            data = {"cells": cells, "parts": parts, "failed": failed, "seed": worldfp._h(*worldfp.SEED_CHECK)}
         with open(dest, "wb") as fh:
             pickle.dump(data, fh, protocol=5)
         return
@@ -834,6 +858,18 @@ def _execute_mode(mode: str, values, out) -> None:
                         return res
                     tables.find = logged_find
                     optimized = optimize(expr, schema, leave_tables_isolated=True)
+                    if "opt_fp" in exp_i:
+                        ho = hashlib.blake2b(digest_size=16)
+                        ho.update(json.dumps(tnames).encode())
+                        _ast_fp(optimized, ho)
+                        if ho.hexdigest() != exp_i["opt_fp"]:
+                            py_diff.append(i)
+                            if costs:
+                                diff_cost += costs[i]
+                            if diff_budget is not None and diff_cost > diff_budget:
+                                aborted = True
+                                break
+                            continue
                     optimized.sql(pretty=True)
                     plan = Plan(optimized)
                     str(plan)
@@ -1230,7 +1266,15 @@ def _zygote_loop(kind: str = "test") -> None:
 
     if kind == "world":
         # Must NOT import unittest or logging, which would alter UNITTEST / logger fingerprints!
+        global _WORLD_OLD_CELLS
+        import gzip as _gz
         import worldfp  # noqa: F401
+        wpath = Path(app_dir) / "world.pkl.gz"
+        if wpath.is_file():
+            try:
+                _WORLD_OLD_CELLS = pickle.loads(_gz.decompress(wpath.read_bytes())).get("cells")
+            except Exception:
+                _WORLD_OLD_CELLS = None
     else:
         import concurrent.futures  # noqa: F401
         import csv  # noqa: F401
@@ -1319,9 +1363,12 @@ def _zygote_loop(kind: str = "test") -> None:
                                     if locs is not None and locs is not pmod.__path__:
                                         locs.insert(0, sub)
                             _imp.invalidate_caches()
-                            with open(r["out"], "w", buffering=1, encoding="utf-8") as fh:
-                                _execute_mode(r["mode"], r["values"], fh)
-                                fh.flush()
+                            if r["mode"] == "world":
+                                _execute_mode("world", r["values"], None)
+                            else:
+                                with open(r["out"], "w", buffering=1, encoding="utf-8") as fh:
+                                    _execute_mode(r["mode"], r["values"], fh)
+                                    fh.flush()
                         except BaseException:
                             pass
                         finally:
@@ -1372,7 +1419,7 @@ def _zygote_loop(kind: str = "test") -> None:
                 heavy_loaded = True
                 if sg_pid is not None:
                     _close_sg()
-            if kind != "world" and req.get("preimport_sg") and req.get("sg_root"):
+            if req.get("preimport_sg") and req.get("sg_root"):
                 if sg_pid is not None and sg_root_loaded != req["sg_root"]:
                     _close_sg()
                 if sg_pid is None:

@@ -209,12 +209,19 @@ def candidates(
 
     old, new = world["cells"], snap["cells"]
     old_parts, new_parts = world["parts"], snap["parts"]
+    is_diff = bool(snap.get("diff"))
+    if is_diff:
+        removed_set = set(snap.get("removed", ()))
+        iter_cells = set(new) | removed_set | {c for c in world["unstable"] if c[0] in changes}
+    else:
+        removed_set = set()
+        iter_cells = set(old) | set(new)
     touched = set()
     spans = {}
     derived = False
     fn_spans: list[tuple[str, tuple[int, int]]] = []
     all_fn_spans = True
-    for cell in set(old) | set(new):
+    for cell in iter_cells:
         path, qual, attr = cell
         if path not in scope or path in failed_paths or path in new_paths:
             continue
@@ -227,16 +234,19 @@ def candidates(
                 mod_imp = imports.get(path, 0)
                 mask |= (name_masks.get(attr, 0) & mod_imp) or mod_imp
             continue
-        if old.get(cell) == new.get(cell):
+        in_new = (cell not in removed_set) if is_diff else (cell in new)
+        if not is_diff and old.get(cell) == new.get(cell):
             continue
-        if body_cells and cell in body_cells and cell in old and cell in new:
+        if is_diff and cell not in new and cell not in removed_set:
+            continue
+        if body_cells and cell in body_cells and cell in old and in_new:
             continue  # plain function-body edit handled by line coverage + operand refinement
         derived = True
         LAST_CHANGED.append(cell)
         touched.add(path)
         if attr == "<bases>":
             return None
-        if cell in old and cell not in new and not qual:
+        if cell in old and not in_new and not qual:
             mask |= _import_break_mask(path, attr, index, root)
         target = alias.get(cell, cell)
         row = reads.get(target, {})
@@ -272,14 +282,14 @@ def candidates(
             except OSError:
                 spans[path] = {}
         span = spans[path].get(f"{qual}.{attr}" if qual else attr)
-        if qual and attr.endswith("_sql") and (cell not in old or cell not in new or span is None):
+        if qual and attr.endswith("_sql") and (cell not in old or not in_new or span is None):
             dmask = dispatch_by_lower.get(attr[:-4].lower(), 0)
             mask |= (dmask & mod_imp) if dmask else mod_imp
         if span is not None and cell in old:
             hits = line_maps.get(path, {})
             for line in range(span[0], span[1] + 1):
                 mask |= hits.get(line, 0)
-            if cell in new:
+            if in_new:
                 fn_spans.append((path, span))
                 continue
         all_fn_spans = False

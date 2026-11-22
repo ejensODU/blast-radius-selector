@@ -53,33 +53,39 @@ def keytok(k) -> str:
     return "o:" + t.__qualname__
 
 
+_PRIMS = {bool, int, float, complex, str, bytes}
+
+
 class Fingerprinter:
     def __init__(self):
         self.memo = {}
         self.active = set()
 
     def code(self, c: types.CodeType):
-        consts = [self.code(x) if isinstance(x, types.CodeType) else self.fp(x) for x in c.co_consts]
+        fp = self.fp
+        consts = [self.code(x) if isinstance(x, types.CodeType) else fp(x) for x in c.co_consts]
         return _h("code", c.co_name, c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_flags,
                   c.co_code, c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars, c.co_exceptiontable, *consts)
 
     def fp(self, o):
         t = type(o)
-        if o is None or t in (bool, int, float, complex, str, bytes):
-            return _h("c", t.__name__, repr(o))
+        if o is None or t in _PRIMS:
+            return hash(("c", t.__name__, repr(o)))
         i = id(o)
-        got = self.memo.get(i)
+        memo = self.memo
+        got = memo.get(i)
         if got is not None:
             return got
-        if i in self.active:
-            return _h("cycle", t.__qualname__)
-        self.active.add(i)
+        active = self.active
+        if i in active:
+            return hash(("cycle", t.__qualname__))
+        active.add(i)
         try:
             r = self._fp(o, t)
         except Exception as error:  # an unreadable object is opaque, never fatal
             r = _h("error", t.__qualname__, type(error).__name__)
-        self.active.discard(i)
-        self.memo[i] = r
+        active.discard(i)
+        memo[i] = r
         return r
 
     def _fp(self, o, t):
@@ -158,17 +164,25 @@ def _classes(module, prefix):
     return out
 
 
-def snapshot(root: str, names=None):
+def snapshot(root: str, names=None, old_cells=None):
     """cell -> fingerprint, plus per-key fingerprints for dict and set cells.
 
-    A cell is (path, qualname, attribute); qualname is '' for a module global.
+    When old_cells is supplied, only changed/new cells and their parts are returned,
+    along with the list of cells in old_cells (for the visited paths) that vanished.
     """
     fper = Fingerprinter()
     cells, parts = {}, {}
+    seen = set() if old_cells is not None else None
+    visited_paths = set() if old_cells is not None else None
     prefix = root.rstrip("/") + "/"
 
     def record(cell, value):
-        cells[cell] = fper.fp(value)
+        fp = fper.fp(value)
+        if seen is not None:
+            seen.add(cell)
+            if old_cells.get(cell) == fp:
+                return
+        cells[cell] = fp
         if isinstance(value, dict):
             parts[cell] = {keytok(k): _h(fper.fp(k), fper.fp(v)) for k, v in dict.items(value)}
         elif isinstance(value, (set, frozenset)):
@@ -181,20 +195,29 @@ def snapshot(root: str, names=None):
         if names is not None and name not in names:
             continue
         path = filename[len(prefix):]
+        if visited_paths is not None:
+            visited_paths.add(path)
         for attr, value in list(vars(module).items()):
             if attr in SKIP_GLOBALS:
-                continue
-            if isinstance(value, types.ModuleType):
-                record((path, "", attr), value)
                 continue
             record((path, "", attr), value)
         for cls in _classes(module, prefix):
             q = cls.__qualname__
-            cells[(path, q, "<bases>")] = _h(*[f"{b.__module__}.{b.__qualname__}" for b in cls.__mro__])
+            bcell = (path, q, "<bases>")
+            bfp = _h(*[f"{b.__module__}.{b.__qualname__}" for b in cls.__mro__])
+            if seen is not None:
+                seen.add(bcell)
+                if old_cells.get(bcell) != bfp:
+                    cells[bcell] = bfp
+            else:
+                cells[bcell] = bfp
             for attr, value in list(vars(cls).items()):
                 if attr in SKIP_CLASS:
                     continue
                 record((path, q, attr), value)
+    if seen is not None:
+        removed = [c for c in old_cells if c[0] in visited_paths and c not in seen]
+        return cells, parts, removed
     return cells, parts
 
 

@@ -261,7 +261,8 @@ def _unrelated_test_item(test, item, bit, index):
     return True
 
 
-def slice_plan(test, entry, impacts, world_paths, parts, index, root, world_fn_spans=None):
+def slice_plan(test, entry, impacts, world_paths, parts, index, root,
+               world_fn_spans=None, world_changed=None, world_failed=None):
     """Elements of a fixture-driven test that the patch can reach, or None when that is not known."""
     bit = 1 << index.names.index(test)
     need = 0
@@ -287,22 +288,45 @@ def slice_plan(test, entry, impacts, world_paths, parts, index, root, world_fn_s
                 continue  # only touched via an unused class set-up attribute
             return None
         if item.path in world_paths:
-            if not world_fn_spans:
-                return None
             if not world_checked:
                 world_checked = True
-                for wp, (lo, hi) in world_fn_spans:
-                    cover = entry["lines"].get(wp, {})
-                    setup = entry["setup"].get(wp, ())
-                    outer = entry.get("outer", {}).get(wp, ())
-                    credited = index.profile["lines"].get(wp, {})
-                    for line in range(lo, hi + 1):
-                        if line in setup:
+                if world_fn_spans:
+                    for wp, (lo, hi) in world_fn_spans:
+                        cover = entry["lines"].get(wp, {})
+                        setup = entry["setup"].get(wp, ())
+                        outer = entry.get("outer", {}).get(wp, ())
+                        credited = index.profile["lines"].get(wp, {})
+                        for line in range(lo, hi + 1):
+                            if line in setup:
+                                return None
+                            hit = cover.get(line, cover.get(str(line), 0))
+                            if not hit and line not in outer and credited.get(line, 0) & bit:
+                                return None
+                            need |= hit
+                elif "rel" in entry and world_changed and not world_failed:
+                    from probe import _SQLGLOT_IMPORT_FILES
+                    wfiles = {c[0] for c in world_changed}
+                    if not all(
+                        (wp.startswith(_POOL_SAFE_PREFIXES)
+                         or (wp.startswith("sqlglot/dialects/") and wp != "sqlglot/dialects/dialect.py"))
+                        and wp not in _SQLGLOT_IMPORT_FILES
+                        and not entry["setup"].get(wp)
+                        for wp in wfiles
+                    ):
+                        return None
+                    for wp in wfiles:
+                        cover = entry["lines"].get(wp, {})
+                        outer = entry.get("outer", {}).get(wp, ())
+                        hit_any = 0
+                        for m in cover.values():
+                            hit_any |= m
+                        if not hit_any and not outer and any(
+                            m & bit for m in index.profile["lines"].get(wp, {}).values()
+                        ):
                             return None
-                        hit = cover.get(line, cover.get(str(line), 0))
-                        if not hit and line not in outer and credited.get(line, 0) & bit:
-                            return None
-                        need |= hit
+                        need |= hit_any
+                else:
+                    return None
             if item.kind != "body":
                 continue
         if item.kind != "body" or not item.path.startswith("sqlglot/"):
@@ -718,7 +742,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             entry = opt_slices_data.get(test)
             if not entry or test not in index.row:
                 continue
-            idxs = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root, world_fn_spans)
+            idxs = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root,
+                              world_fn_spans, world_changed, world_failed)
             if idxs is not None and len(idxs) < entry["size"]:
                 idxs.sort(key=lambda i: entry["cost"][i])
                 fixture_slices[test] = {"rel": entry["rel"], "indices": idxs, "size": entry["size"]}
@@ -739,9 +764,12 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         )
     )
 
+    pool_set = {k for users in pool_groups(index) for k in users}
+    cpu_kw = {"weights": weights, "row": index.row, "pool_set": pool_set}
+
     # Check whether Step B will already run directly (so Step A2 doesn't duplicate a sliced test).
     stepB_ready = False
-    if probes and ids and len(ids) <= 130 and probe_budget > 0.5 and probe_eligible and explained and not probe_test_block:
+    if probes and ids and len(ids) <= 200 and probe_budget > 0.5 and probe_eligible and explained and not probe_test_block:
         _chosen0 = set(ids)
         _casc0 = []
         if fragile:
@@ -752,8 +780,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         _unp0 = plan_cost(schedule(number(ids + _casc0), weights), weights)
         _pln0 = plan_cost(schedule(number(ids), weights), weights)
         _sk0 = setup_safe and not (_chosen0 & TPC_SET)
-        _cpu0 = probe_cpu_ms(ids, nominal_ms, skip_exec_setup=_sk0, extra_override=extra_override, use_sg=use_sg)
-        stepB_ready = 0.45 * _unp0 + 0.55 * max(0.0, _unp0 - 0.95 * _pln0) - _cpu0 > 0
+        _cpu0 = probe_cpu_ms(ids, nominal_ms, skip_exec_setup=_sk0, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
+        stepB_ready = (len(ids) <= 130 or _cpu0 <= 3000) and (0.45 * _unp0 + 0.55 * max(0.0, _unp0 - 0.95 * _pln0) - _cpu0 > 0)
 
     # Step A2: Decide heavy fixture-driven TestOptimizer tests (test_tpcds, test_tpch) via fail-fast slices
     # when Step B will not already run them sliced in one fork.
@@ -764,7 +792,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             continue
         if stepB_ready and test in fixture_slices:
             continue
-        indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root, world_fn_spans)
+        indices = slice_plan(test, entry, impacts, effective_world_paths, parts, index, root,
+                             world_fn_spans, world_changed, world_failed)
         if indices is not None and not indices:
             continue
         if indices is None:
@@ -780,7 +809,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         if rem_ids and len(rem_ids) <= 45 and python_edit:
             rem_nom = sum(weights[index.row[k]["number"]] for k in rem_ids)
             rem_skip = setup_safe and not (set(rem_ids) & TPC_SET)
-            rem_cpu = probe_cpu_ms(rem_ids, rem_nom, skip_exec_setup=rem_skip, extra_override=extra_override, use_sg=use_sg)
+            rem_cpu = probe_cpu_ms(rem_ids, rem_nom, skip_exec_setup=rem_skip, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
             if 0.48 * rem_ms - rem_cpu > 0:
                 unlock_bonus = 0.40 * (rem_ms - rem_cpu)
         est_cpu = 80 + int(0.38 * sum(entry["cost"][i] for i in indices))
@@ -805,7 +834,6 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             known_fail.add(test)
 
     chosen = set(ids)
-    pool_set = {k for users in pool_groups(index) for k in users}
     cascade = []
     if fragile:
         for users in pool_groups(index):
@@ -833,12 +861,13 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     plain_ms = plan_cost(schedule(number(ids), weights), weights)
     fixed_ms = plan_cost(schedule(number(list(fixed_keep)), weights), weights) if fixed_keep else 0
     skip_exec_setup = setup_safe and not (set(probe_ids) & TPC_SET)
-    cpu_ms = probe_cpu_ms(probe_ids, probe_nom, skip_exec_setup=skip_exec_setup, extra_override=extra_override, use_sg=use_sg)
+    cpu_ms = probe_cpu_ms(probe_ids, probe_nom, skip_exec_setup=skip_exec_setup, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
     pot_saving = unprobed_ms - fixed_ms
     worth = bool(probe_ids) and (0.45 * pot_saving + 0.55 * max(0.0, unprobed_ms - 0.95 * plain_ms) - cpu_ms > 0)
+    stepB_size_ok = len(probe_ids) <= 130 or (len(probe_ids) <= 200 and cpu_ms <= 3000)
     if debug and ids:
         print("   probe-data " + json.dumps({"ids": number(probe_ids), "cascade": number(cascade), "cpu": round(cpu_ms),
-                                             "ok": bool(probe_eligible and explained and not probe_test_block and len(probe_ids) <= 130),
+                                             "ok": bool(probe_eligible and explained and not probe_test_block and stepB_size_ok),
                                              "sliced": len(fixture_slices), "fixed": len(fixed_keep), "sg": use_sg}),
               file=sys.stderr)
         print(f"   probe estimate cpu={cpu_ms:.0f} unprobed={unprobed_ms} worth={worth} skip_setup={skip_exec_setup} fragile={fragile}", file=sys.stderr)
@@ -857,7 +886,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
 
     full_probed = False
     broken_users = set()
-    if (probes and probe_ids and worth and len(probe_ids) <= 130 and probe_budget > 0.5 and probe_eligible and explained
+    if (probes and probe_ids and worth and stepB_size_ok and probe_budget > 0.5 and probe_eligible and explained
             and not probe_test_block):
         from probe import BROKEN, COMPLETE, probe
         changes = changes or patch_sources(text, root)
@@ -883,7 +912,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             casc_saving = unprobed_ms - plain_ms
             if hit_users and len(hit_users) <= 30 and casc_saving >= 1500:
                 hit_nom = sum(weights[index.row[k]["number"]] for k in hit_users)
-                hit_cpu = probe_cpu_ms(hit_users, hit_nom, skip_exec_setup=True, use_sg=use_sg)
+                hit_cpu = probe_cpu_ms(hit_users, hit_nom, skip_exec_setup=True, use_sg=use_sg, **cpu_kw)
                 hit_set = set(hit_users)
                 without_hit_ms = plan_cost(schedule(number([k for k in ids if k not in hit_set]), weights), weights)
                 exp_saving = 0.85 * casc_saving + 0.45 * (plain_ms - without_hit_ms)
@@ -912,7 +941,7 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             c2_eligible.append(key)
             rem_cost = plan_cost(schedule(number([k for k in ids if k != key]), weights), weights)
             saving = base_cost - rem_cost
-            scpu = probe_cpu_ms([key], w_ms, skip_exec_setup=setup_safe, extra_override=extra_override, use_sg=use_sg)
+            scpu = probe_cpu_ms([key], w_ms, skip_exec_setup=setup_safe, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
             if saving > 0 and 0.48 * saving > scpu:
                 bottlenecks.append((key, saving, scpu))
             if len(bottlenecks) >= 3:
@@ -922,12 +951,12 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
             pair = c2_eligible[:2]
             pair_sav = base_cost - plan_cost(schedule(number([k for k in ids if k not in set(pair)]), weights), weights)
             pair_cpu = probe_cpu_ms(pair, sum(weights[index.row[k]["number"]] for k in pair),
-                                    skip_exec_setup=setup_safe, extra_override=extra_override, use_sg=use_sg)
+                                    skip_exec_setup=setup_safe, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
             if pair_sav >= 1500 and 0.48 * pair_sav > pair_cpu:
                 sub = pair
         if sub:
             sub_cpu = probe_cpu_ms(sub, sum(weights[index.row[k]["number"]] for k in sub),
-                                   skip_exec_setup=setup_safe, extra_override=extra_override, use_sg=use_sg)
+                                   skip_exec_setup=setup_safe, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
             sub_saving = base_cost - plan_cost(schedule(number([k for k in ids if k not in set(sub)]), weights), weights)
             if debug:
                 print(f"   bottleneck-probe n={len(sub)} cpu={sub_cpu:.0f} saving={sub_saving}", file=sys.stderr)
@@ -944,15 +973,15 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                     ids = [key for key in ids if key not in passing]
                     base_cost = plan_cost(schedule(number(ids), weights), weights)
         # C3: If a few expensive-to-probe tests blocked Step B, probe the cheap remainder if profitable.
-        if ids and len(ids) <= 130:
+        if ids and len(ids) <= 200:
             eligible = [k for k in ids if k not in TPC_SET and k not in known_fail and k not in fixed_keep and not (fragile and k in pool_set)]
             if len(eligible) >= 2:
                 # Sort by per-test incremental probe cost descending and peel off up to 8 heavy blockers.
-                tmap = (_PROBE_COST or {}).get("tests", {})
-                fmap = (_PROBE_COST or {}).get("files", {})
+                if _PROBE_COST is None:
+                    probe_cpu_ms([], 0)
                 by_cost = sorted(
                     eligible,
-                    key=lambda k: -(extra_override[k] if k in extra_override else (tmap.get(k, weights[index.row[k]["number"]]) - fmap.get(k.split("::")[0], 0))),
+                    key=lambda k: -_test_extra_ms(k, _PROBE_COST or {}, extra_override, **cpu_kw),
                 )
                 best_sub = None
                 for drop_k in range(0 if known_fail else 1, min(9, len(by_cost))):
@@ -960,7 +989,9 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                     cand_set = set(cand)
                     c_skip = setup_safe and not (cand_set & TPC_SET)
                     c_cpu = probe_cpu_ms(cand, sum(weights[index.row[k]["number"]] for k in cand),
-                                         skip_exec_setup=c_skip, extra_override=extra_override, use_sg=use_sg)
+                                         skip_exec_setup=c_skip, extra_override=extra_override, use_sg=use_sg, **cpu_kw)
+                    if len(cand) > 130 and c_cpu > 3000:
+                        continue
                     c_sav = base_cost - plan_cost(schedule(number([k for k in ids if k not in cand_set]), weights), weights)
                     margin = 0.50 * c_sav - c_cpu
                     if margin > 300 and (best_sub is None or margin > best_sub[0]):
@@ -1022,8 +1053,27 @@ def breaks_pool(item, world_paths, pool_safe=False):
 _PROBE_COST = None
 
 
-def probe_cpu_ms(ids, nominal_ms, skip_exec_setup=False, extra_override=None, use_sg=False):
-    """Measured cost of a forked zygote probe: base import overhead + marginal per-file + per-test."""
+def _test_extra_ms(key, table, extra_override=None, weights=None, row=None, pool_set=None):
+    if extra_override and key in extra_override:
+        return extra_override[key]
+    tmap = table.get("tests", {})
+    fmap = table.get("files", {})
+    if key in tmap:
+        raw = max(0, tmap[key] - fmap.get(key.split("::")[0], 0))
+    elif weights is not None and row is not None and key in row:
+        raw = weights[row[key]["number"]]
+    else:
+        raw = 0
+    if weights is not None and row is not None and key in row:
+        w_ms = weights[row[key]["number"]]
+        if w_ms < 500 and not (pool_set and key in pool_set and w_ms >= 150):
+            return min(raw, int(2.4 * w_ms) + 20)
+    return raw
+
+
+def probe_cpu_ms(ids, nominal_ms, skip_exec_setup=False, extra_override=None, use_sg=False,
+                 weights=None, row=None, pool_set=None):
+    """Measured cost of a forked zygote probe: start-up, imports, class set-up, and per-test work."""
     global _PROBE_COST
     if _PROBE_COST is None:
         try:
@@ -1051,8 +1101,7 @@ def probe_cpu_ms(ids, nominal_ms, skip_exec_setup=False, extra_override=None, us
                 cost -= 320
         cost = max(cost, 30)
         extra = sum(
-            (extra_override[key] if (extra_override and key in extra_override)
-             else (table["tests"][key] - table["files"][key.split("::")[0]]))
+            _test_extra_ms(key, table, extra_override, weights, row, pool_set)
             for key in ids
         )
         return 0.52 * (cost + extra)

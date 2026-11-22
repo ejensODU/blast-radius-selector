@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from impact import Impact
-from selector import TPC_CDS, TestIndex, _phase1_safe, select, slice_plan
+from selector import TPC_CDS, TestIndex, _phase1_safe, _test_extra_ms, select, slice_plan
 import structure
 
 
@@ -112,3 +112,33 @@ class SelectionTests(unittest.TestCase):
              Impact("tests/dialects/test_postgres.py", "body", frozenset({5}))],
             set(), None, [], [], False, True, idx, self.root, p1,
         ))
+
+    def test_leaf_dialect_world_slicing_and_tiny_test_cost_cap(self):
+        tid = "s.py::C::test_20"
+        entry = {
+            "file": "f.sql",
+            "rel": "optimizer/simplify.sql",
+            "size": 4,
+            "lines": {"sqlglot/dialects/tsql.py": {10: 0b0101}},
+            "setup": {},
+            "outer": {},
+        }
+        impacts = [Impact("sqlglot/dialects/tsql.py", "binding", frozenset({10}))]
+        got = slice_plan(
+            tid, entry, impacts, {"sqlglot/dialects/tsql.py"}, {}, self.index, self.root,
+            world_changed=[("sqlglot/dialects/tsql.py", "TSQL", "WEEK_OFFSET")],
+            world_failed=[],
+        )
+        self.assertEqual(got, [0, 2])
+        # Core file edit must NOT use leaf-dialect file slicing
+        self.assertIsNone(slice_plan(
+            tid, entry, [Impact("sqlglot/parser.py", "binding", frozenset({10}))],
+            {"sqlglot/parser.py"}, {}, self.index, self.root,
+            world_changed=[("sqlglot/parser.py", "Parser", "X")], world_failed=[],
+        ))
+        # Tiny-test phantom-noise cap suppresses fresh-process setup jitter while keeping heavy pool costs
+        table = {"tests": {"t_tiny": 500, "t_pool": 9000}, "files": {"t": 100}}
+        row = {"t_tiny": {"number": 1}, "t_pool": {"number": 2}}
+        weights = {1: 5, 2: 2000}
+        self.assertEqual(_test_extra_ms("t_tiny", table, weights=weights, row=row, pool_set={"t_pool"}), 32)
+        self.assertEqual(_test_extra_ms("t_pool", table, weights=weights, row=row, pool_set={"t_pool"}), 9000 - 0)
