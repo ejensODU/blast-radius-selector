@@ -114,6 +114,18 @@ def patch_sources(text, root):
 
 
 def select(text, root, index, probe_budget, debug=False, probes=True):
+    # Added, deleted, renamed and unread files, and reshaped test modules, are
+    # answered from recorded file and line dependencies; the rest goes on below.
+    import structure
+    plain, extra = structure.resolve(text, index, root)
+    if extra is structure.FULL:
+        return schedule([row["number"] for row in index.row.values()], index.durations)
+    if plain != text:
+        if debug:
+            print("structural", len(index.selected_ids(extra)), "plain" if plain else "", file=sys.stderr)
+        if not plain:
+            return schedule([index.row[key]["number"] for key in index.selected_ids(extra)], index.durations)
+        text = plain
     impacts = analyze(text, root)
     parts = {part.path: part for part in parse_patch(text)}
     startup = index.profile["startup_body"]
@@ -152,46 +164,48 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
         print([(item.kind, item.path) for item in impacts], len(ids), nominal_ms,
               "world" if world_mask is not None else "", file=sys.stderr)
 
-    # A fresh interpreter can validate a short candidate list for a fraction of
-    # the 2 seconds starting even one worker costs. Keep full coverage when a
-    # check is too costly or the result is indeterminate. A list that touches
-    # the optimizer's shared process pool gets a longer leash: without a probe,
-    # every later user of that pool has to be selected as well.
-    chosen = set(ids)
-    cascade = []
-    for users in pool_groups(index):
-        hit = [key for key in users if key in chosen]
-        if hit:
-            cascade.extend(key for key in users[users.index(hit[0]) + 1:] if key not in chosen)
-    number = lambda keys: [index.row[key]["number"] for key in keys]
-    plain_ms = plan_cost(schedule(number(ids), weights), weights)
-    # What it costs to leave the pool question open: every later pool user is selected.
-    open_ms = plan_cost(schedule(number(ids + cascade), weights), weights) - plain_ms if cascade else 0
-    setup_ms = (2000 if any(key.startswith("tests/test_executor.py::") for key in ids) else 0) + (100 if cascade else 0)
-    probe_ms = 1.2 * nominal_ms + setup_ms + 300
+    # A test whose task kills a worker of the class-level process pool takes
+    # down every later test that shares the pool, whatever those tests run. A
+    # worker only dies while unpickling what crosses the pool boundary, so an
+    # edit inside a function body matters here only on a line recorded there.
     python_edit = any(item.kind in ("body", "binding") or item.path in world_paths for item in impacts)
     explained = all(item.kind in ("equivalent", "body", "binding", "fixture")
                     or (world_mask is not None and item.path in world_paths) for item in impacts)
-    # Probe a short list (it may prove that nothing fails), or a longer one when
-    # the probe is cheaper than selecting the rest of the pool's users.
-    worth = (nominal_ms <= 700 and (setup_ms < 2000 or open_ms >= 2000)) or probe_ms < open_ms
-    if probes and ids and worth and len(ids) <= 130 and probe_budget > 0.5 and python_edit and explained:
+    fragile = any(breaks_pool(item, world_paths) for item in impacts)
+    chosen = set(ids)
+    cascade = []
+    if fragile:
+        for users in pool_groups(index):
+            hit = [key for key in users if key in chosen]
+            if hit:
+                cascade.extend(key for key in users[users.index(hit[0]) + 1:] if key not in chosen)
+    number = lambda keys: [index.row[key]["number"] for key in keys]
+    # Without a probe the whole list runs, plus every later user of a pool in doubt.
+    unprobed_ms = plan_cost(schedule(number(ids + cascade), weights), weights)
+    # A probe in a fresh interpreter costs CPU seconds one for one. About half of
+    # the lists it is tried on turn out to contain no failing test at all; when
+    # some test does fail, roughly a worker start and the failing share remain.
+    remaining_ms = 2000 + 0.4 * nominal_ms
+    cpu_ms = probe_cpu_ms(ids, nominal_ms)
+    worth = unprobed_ms - 0.5 * remaining_ms - cpu_ms > 0
+    # A test run alone says nothing about state its own set-up or tear-down leaves
+    # for others, so edited test code is not probed.
+    test_code = any(item.path.startswith("tests/") and item.path.endswith(".py") and item.kind != "equivalent"
+                    for item in impacts)
+    if (probes and ids and worth and len(ids) <= 130 and probe_budget > 0.5 and python_edit and explained
+            and not test_code):
         from probe import probe
         changes = changes or patch_sources(text, root)
         if changes:
             ids.sort(key=lambda key: index.row[key]["number"])
-            # The manifest measures steady-state execution; a fresh process can
-            # also pay import and class setup costs. Limit that extra CPU spend.
-            deadline = min(probe_budget, 2.0 + 2.5 * nominal_ms / 1000)
+            # The limit only has to stop a patch that hangs; leave room for a slower machine.
+            deadline = min(probe_budget, 3.0 + 3.0 * cpu_ms / 1000)
             passing = probe(root, changes, ids, deadline)
             # Only a probe that accounted for every test says anything about the pool.
             from probe import COMPLETE
             probed = bool(COMPLETE)
             ids = [key for key in ids if key not in passing]
-    # A test whose task kills a worker of the class-level process pool takes
-    # down every later test that shares the pool, whatever those tests run.
-    python_change = any(part.endswith(".py") for part in parts)
-    if python_change and ids:
+    if fragile and ids:
         chosen = set(ids)
         for users in pool_groups(index):
             hit = [key for key in users if key in chosen]
@@ -205,8 +219,41 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
                 first = hit[0]
             if first is not None:
                 ids.extend(key for key in users[users.index(first) + 1:] if key not in chosen)
+    if extra:
+        chosen = set(ids)
+        ids.extend(key for key in index.selected_ids(extra) if key not in chosen)
     numbers = [index.row[nodeid]["number"] for nodeid in ids]
     return schedule(numbers, weights)
+
+
+_POOL_LINES = None
+
+
+def breaks_pool(item, world_paths):
+    """Can this edit make unpickling at the process-pool boundary fail?"""
+    global _POOL_LINES
+    if item.kind in ("equivalent", "fixture") or not item.path.endswith(".py"):
+        return False
+    if item.kind != "body" or item.path in world_paths:
+        return True
+    if _POOL_LINES is None:
+        try:
+            _POOL_LINES = {path: frozenset(lines) for path, lines
+                           in json.loads((APP / "pool_lines.json").read_text()).items()}
+        except (OSError, ValueError):
+            return True
+    return bool(item.lines & _POOL_LINES.get(item.path, frozenset()))
+
+
+def probe_cpu_ms(ids, nominal_ms):
+    """Measured cost of a fresh interpreter running these tests: start-up, imports, class set-up."""
+    files = {key.split("::")[0] for key in ids}
+    cost = 300 + 40 * len(files) + 1.15 * nominal_ms
+    if files & {"tests/test_executor.py", "tests/test_optimizer.py"}:
+        cost += 450  # pandas and duckdb
+    if "tests/test_executor.py" in files:
+        cost += 1750  # TestExecutor.setUpClass loads the TPC tables
+    return cost
 
 
 def plan_cost(workers, weights):

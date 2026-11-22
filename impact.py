@@ -156,19 +156,69 @@ def _source(path: Path):
     return original, tree, compiled
 
 
-def _same_code(left, right):
-    """Ignore source positions, preserving code, constants, symbols and exception tables."""
+_FRAME_READERS = frozenset({"locals", "vars", "eval", "exec", "dir", "_getframe", "currentframe", "f_locals"})
+
+
+def _same_code(left, right, loose=False):
+    """Ignore source positions, preserving code, constants, symbols and exception tables.
+
+    With `loose`, the names of plain local variables are ignored as well: they are
+    slots in the frame, and renaming one consistently leaves the bytecode unchanged.
+    """
     if type(left) is not type(right):
         return False
     if isinstance(left, tuple):
-        return len(left) == len(right) and all(_same_code(a, b) for a, b in zip(left, right))
+        return len(left) == len(right) and all(_same_code(a, b, loose) for a, b in zip(left, right))
     if not isinstance(left, types.CodeType):
         # repr distinguishes signed zero and typed values inside frozen constants.
         return left == right and repr(left) == repr(right)
     attrs = ("co_name", "co_qualname", "co_argcount", "co_posonlyargcount", "co_kwonlyargcount",
-             "co_code", "co_names", "co_varnames", "co_cellvars", "co_freevars", "co_flags",
+             "co_code", "co_names", "co_cellvars", "co_freevars", "co_flags",
              "co_exceptiontable")
-    return all(getattr(left, k) == getattr(right, k) for k in attrs) and _same_code(left.co_consts, right.co_consts)
+    if not all(getattr(left, k) == getattr(right, k) for k in attrs):
+        return False
+    if left.co_varnames != right.co_varnames:
+        named = left.co_argcount + left.co_kwonlyargcount + bool(left.co_flags & 4) + bool(left.co_flags & 8)
+        if (not loose or len(left.co_varnames) != len(right.co_varnames)
+                or left.co_varnames[:named] != right.co_varnames[:named]):
+            return False
+    return _same_code(left.co_consts, right.co_consts, loose)
+
+
+def _names(code):
+    found = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            found |= _names(const)
+    return found
+
+
+class _DropPass(ast.NodeTransformer):
+    """`pass` beside other statements only leaves a no-op for the line tracer."""
+
+    def generic_visit(self, node):
+        super().generic_visit(node)
+        for name in ("body", "orelse", "finalbody"):
+            block = getattr(node, name, None)
+            if isinstance(block, list) and len(block) > 1:
+                kept = [stmt for stmt in block if not isinstance(stmt, ast.Pass)]
+                if kept and len(kept) != len(block):
+                    setattr(node, name, kept)
+        return node
+
+
+def _refactor_only(original, modified, path):
+    """Same program after dropping redundant `pass` statements and local variable names."""
+    try:
+        codes = []
+        for text in (original, modified):
+            tree = _DropPass().visit(ast.parse(text.encode("utf-8"), path))
+            codes.append(compile(ast.fix_missing_locations(tree), path, "exec", dont_inherit=True))
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    if (_names(codes[0]) | _names(codes[1])) & _FRAME_READERS:
+        return False
+    return _same_code(codes[0], codes[1], loose=True)
 
 
 def _node_path(node: ast.AST, line: int, col: int):
@@ -275,7 +325,8 @@ def _one(patch, root):
     updated = compile(updated_tree, path, "exec", dont_inherit=True)
     text_only = all(not line.strip() or line.lstrip().startswith("#")
                     for block in changes for line in (*block.before, *block.after))
-    if _same_code(code, updated) or (text_only and ast.dump(tree) == ast.dump(updated_tree)):
+    if (_same_code(code, updated) or (text_only and ast.dump(tree) == ast.dump(updated_tree))
+            or _refactor_only(original, modified, path)):
         return [Impact(path, "equivalent")]
     executable = set(_executable(code))
     result = []
