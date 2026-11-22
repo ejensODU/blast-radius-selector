@@ -242,6 +242,8 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     remaining_ms = 2000 + 0.4 * nominal_ms
     cpu_ms = probe_cpu_ms(ids, nominal_ms)
     worth = unprobed_ms - 0.5 * remaining_ms - cpu_ms > 0
+    if debug and ids:
+        print(f"   probe estimate cpu={cpu_ms:.0f} unprobed={unprobed_ms} worth={worth}", file=sys.stderr)
     # A test run alone says nothing about state its own set-up or tear-down leaves
     # for others, so edited test code is not probed.
     test_code = any(item.path.startswith("tests/") and item.path.endswith(".py") and item.kind != "equivalent"
@@ -299,9 +301,30 @@ def breaks_pool(item, world_paths):
     return bool(item.lines & _POOL_LINES.get(item.path, frozenset()))
 
 
+_PROBE_COST = None
+
+
 def probe_cpu_ms(ids, nominal_ms):
     """Measured cost of a fresh interpreter running these tests: start-up, imports, class set-up."""
+    global _PROBE_COST
+    if _PROBE_COST is None:
+        try:
+            _PROBE_COST = json.loads((APP / "probe_cost.json").read_text())
+        except (OSError, ValueError):
+            _PROBE_COST = {}
+    table = _PROBE_COST
     files = {key.split("::")[0] for key in ids}
+    if table and all(key in table["tests"] for key in ids):
+        # Each test was timed alone. A file's cheapest test stands for its imports
+        # and class set-up, paid once; the rest of each test's time adds up.
+        cost = table["base"]
+        for name in files:
+            cost += table["files"][name] - table["base"]
+        cost -= table["library"] * (len(files) - 1)
+        extra = sum(table["tests"][key] - table["files"][key.split("::")[0]] for key in ids)
+        # Tests timed alone each pay warm-up that a shared interpreter pays once;
+        # observed probes cost about three quarters of the sum.
+        return 0.75 * (cost + extra)
     cost = 300 + 40 * len(files) + 1.15 * nominal_ms
     if files & {"tests/test_executor.py", "tests/test_optimizer.py"}:
         cost += 450  # pandas and duckdb
