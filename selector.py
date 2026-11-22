@@ -116,6 +116,8 @@ def patch_sources(text, root):
 def select(text, root, index, probe_budget, debug=False, probes=True):
     # Added, deleted, renamed and unread files, and reshaped test modules, are
     # answered from recorded file and line dependencies; the rest goes on below.
+    if not text.strip():
+        return []  # an empty patch changes nothing
     import structure
     plain, extra = structure.resolve(text, index, root)
     if extra is structure.FULL:

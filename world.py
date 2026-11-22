@@ -50,7 +50,8 @@ def _snapshot(root: Path, changes: dict[str, str], names: list[str], timeout: fl
             child = subprocess.Popen(
                 [sys.executable, "-B", str(APP / "worldfp.py"), "--names", str(shadow), str(out)],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(shadow), SKIP_INTEGRATION="0"))
+                env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(shadow), SKIP_INTEGRATION="0",
+                         PYTHONHASHSEED="0"))
             try:
                 child.communicate("\n".join(names).encode(), timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -102,8 +103,8 @@ def candidates(root: Path, index, changes: dict[str, str], timeout: float = 20.0
         scope.update(world["importers"].get(path, ()))
     names = sorted({_module_name(path) for path in scope})
     snap = _snapshot(root, changes, names, timeout)
-    if snap is None:
-        return None
+    if snap is None or snap.get("seed") != world.get("seed"):
+        return None  # fingerprints from a different interpreter build cannot be compared
     line_maps, name_masks, classes = profile["lines"], profile["names"], profile["classes"]
     imports, reads, wrapped, alias = keys["imports"], keys["reads"], keys["wrapped"], keys["alias"]
     mask = 0

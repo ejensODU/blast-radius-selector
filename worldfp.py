@@ -18,12 +18,19 @@ SKIP_GLOBALS = {"__builtins__", "__cached__", "__file__", "__loader__", "__spec_
 SKIP_CLASS = {"__dict__", "__weakref__", "__module__", "__firstlineno__", "__static_attributes__", "__qualname__"}
 
 
-def _h(*parts) -> str:
-    m = hashlib.blake2b(digest_size=8)
-    for p in parts:
-        m.update(p if isinstance(p, bytes) else str(p).encode("utf-8", "backslashreplace"))
-        m.update(b"\x00")
-    return m.hexdigest()
+def _h(*parts):
+    """Combine parts into one fingerprint.
+
+    The interpreter's own tuple hash, which is the same in every process started
+    with PYTHONHASHSEED=0 on one Python build. Both snapshots are taken that way.
+    """
+    try:
+        return hash(parts)
+    except TypeError:
+        return hash(tuple(p if isinstance(p, (bytes, str, int)) else repr(p) for p in parts))
+
+
+SEED_CHECK = ("fingerprint", "seed", 0, b"check")
 
 
 def keytok(k) -> str:
@@ -51,12 +58,12 @@ class Fingerprinter:
         self.memo = {}
         self.active = set()
 
-    def code(self, c: types.CodeType) -> str:
+    def code(self, c: types.CodeType):
         consts = [self.code(x) if isinstance(x, types.CodeType) else self.fp(x) for x in c.co_consts]
         return _h("code", c.co_name, c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_flags,
                   c.co_code, c.co_names, c.co_varnames, c.co_freevars, c.co_cellvars, c.co_exceptiontable, *consts)
 
-    def fp(self, o) -> str:
+    def fp(self, o):
         t = type(o)
         if o is None or t in (bool, int, float, complex, str, bytes):
             return _h("c", t.__name__, repr(o))
@@ -75,7 +82,7 @@ class Fingerprinter:
         self.memo[i] = r
         return r
 
-    def _fp(self, o, t) -> str:
+    def _fp(self, o, t):
         if t in (tuple, list):
             return _h(t.__name__, *[self.fp(x) for x in o])
         if isinstance(o, dict):
@@ -231,7 +238,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 2:
         opener = (lambda p: gzip.GzipFile(p, "wb", compresslevel=6, mtime=0)) if sys.argv[2].endswith(".gz") else (lambda p: open(p, "wb"))
         with opener(sys.argv[2]) as out:
-            pickle.dump({"cells": cells, "parts": parts, "failed": failed}, out, protocol=5)
+            pickle.dump({"cells": cells, "parts": parts, "failed": failed, "seed": _h(*SEED_CHECK)}, out, protocol=5)
     print(f"modules failed={len(failed)} cells={len(cells)} keyed={len(parts)} keys={sum(len(v) for v in parts.values())} "
           f"import_cpu={t1-t0:.2f}s snapshot_cpu={t2-t1:.2f}s", file=sys.stderr)
     for name, error in list(failed.items())[:5]:
