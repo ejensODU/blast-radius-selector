@@ -226,6 +226,10 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     explained = all(item.kind in ("equivalent", "body", "binding", "fixture")
                     or (world_mask is not None and item.path in world_paths) for item in impacts)
     fragile = any(breaks_pool(item, world_paths) for item in impacts)
+    # A test run alone says nothing about state its own set-up or tear-down leaves
+    # for others, so edited test code is not probed.
+    test_code = any(item.path.startswith("tests/") and item.path.endswith(".py") and item.kind != "equivalent"
+                    for item in impacts)
     chosen = set(ids)
     cascade = []
     if fragile:
@@ -236,18 +240,18 @@ def select(text, root, index, probe_budget, debug=False, probes=True):
     number = lambda keys: [index.row[key]["number"] for key in keys]
     # Without a probe the whole list runs, plus every later user of a pool in doubt.
     unprobed_ms = plan_cost(schedule(number(ids + cascade), weights), weights)
-    # A probe in a fresh interpreter costs CPU seconds one for one. About half of
-    # the lists it is tried on turn out to contain no failing test at all; when
-    # some test does fail, roughly a worker start and the failing share remain.
-    remaining_ms = 2000 + 0.4 * nominal_ms
+    # A probe in a fresh interpreter costs CPU seconds one for one. On labeled
+    # patches a little under half of the probed lists contained no failing test;
+    # when some test fails, most of the list still has to run, but the pool
+    # question is settled either way.
+    plain_ms = plan_cost(schedule(number(ids), weights), weights)
     cpu_ms = probe_cpu_ms(ids, nominal_ms)
-    worth = unprobed_ms - 0.5 * remaining_ms - cpu_ms > 0
+    worth = 0.45 * unprobed_ms + 0.55 * (unprobed_ms - 0.95 * plain_ms) - cpu_ms > 0
     if debug and ids:
+        print("   probe-data " + json.dumps({"ids": number(ids), "cascade": number(cascade), "cpu": round(cpu_ms),
+                                             "ok": bool(python_edit and explained and not test_code and len(ids) <= 130)}),
+              file=sys.stderr)
         print(f"   probe estimate cpu={cpu_ms:.0f} unprobed={unprobed_ms} worth={worth}", file=sys.stderr)
-    # A test run alone says nothing about state its own set-up or tear-down leaves
-    # for others, so edited test code is not probed.
-    test_code = any(item.path.startswith("tests/") and item.path.endswith(".py") and item.kind != "equivalent"
-                    for item in impacts)
     if (probes and ids and worth and len(ids) <= 130 and probe_budget > 0.5 and python_edit and explained
             and not test_code):
         from probe import probe
