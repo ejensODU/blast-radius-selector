@@ -24,6 +24,10 @@ from pathlib import Path
 APP = Path(__file__).resolve().parent
 LAZY_LOAD = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 
+LAST_CHANGED: list[tuple[str, str, str]] = []
+LAST_FAILED: list[str] = []
+LAST_PURE_BODY: bool = False
+
 
 @lru_cache(maxsize=1)
 def _data():
@@ -88,19 +92,34 @@ def _spans(source: str):
     return out
 
 
-def candidates(root: Path, index, changes: dict[str, str], timeout: float = 20.0):
+def candidates(
+    root: Path,
+    index,
+    changes: dict[str, str],
+    timeout: float = 20.0,
+    body_cells: set[tuple[str, str, str]] | None = None,
+    allow_new: bool = False,
+):
     """A test mask, or None when this analysis cannot vouch for the patch."""
+    global LAST_PURE_BODY
+    LAST_CHANGED.clear()
+    LAST_FAILED.clear()
+    LAST_PURE_BODY = False
     world, keys = _data()
     profile = index.profile
     if keys["ids"] != profile["ids"]:
         return None
     paths = {cell[0] for cell in world["cells"]}
-    if any(path not in paths for path in changes):
+    new_paths = {path for path in changes if path not in paths}
+    if new_paths and not allow_new:
         return None  # a file the snapshot does not cover (new, or not importable by name)
     # Only modules that load a changed module while they import can hold state derived from it.
-    scope = set(changes)
-    for path in changes:
-        scope.update(world["importers"].get(path, ()))
+    if new_paths:
+        scope = set(paths) | set(changes)
+    else:
+        scope = set(changes)
+        for path in changes:
+            scope.update(world["importers"].get(path, ()))
     names = sorted({_module_name(path) for path in scope})
     snap = _snapshot(root, changes, names, timeout)
     if snap is None or snap.get("seed") != world.get("seed"):
@@ -112,10 +131,11 @@ def candidates(root: Path, index, changes: dict[str, str], timeout: float = 20.0
     failed_paths = set()
     for name in snap["failed"]:
         for path in (name.replace(".", "/") + ".py", name.replace(".", "/") + "/__init__.py"):
-            if path in paths:
+            if path in paths or path in new_paths:
                 failed_paths.add(path)
+    LAST_FAILED.extend(sorted(failed_paths))
     for path in failed_paths:
-        if path in world["eager"]:
+        if path in world["eager"] or path in new_paths:
             return None  # the package itself no longer imports: everything is affected
         mask |= imports.get(path, 0)
 
@@ -123,16 +143,22 @@ def candidates(root: Path, index, changes: dict[str, str], timeout: float = 20.0
     old_parts, new_parts = world["parts"], snap["parts"]
     touched = set()
     spans = {}
+    derived = False
     for cell in set(old) | set(new):
         path, qual, attr = cell
-        if path not in scope or path in failed_paths or cell in world["unstable"] or old.get(cell) == new.get(cell):
+        if path not in scope or path in failed_paths or path in new_paths or cell in world["unstable"] or old.get(cell) == new.get(cell):
             continue
+        if body_cells and cell in body_cells and cell in old and cell in new:
+            continue  # plain function-body edit handled by line coverage + operand refinement
+        derived = True
+        LAST_CHANGED.append(cell)
         touched.add(path)
         if attr == "<bases>":
             return None
         target = alias.get(cell, cell)
         row = reads.get(target, {})
-        attr_mask = name_masks.get(attr, 0)
+        mod_imp = imports.get(path, 0)
+        attr_mask = name_masks.get(attr, 0) & mod_imp
         if qual:
             owners = classes.get((path, qual))
             if owners is not None:
@@ -161,9 +187,11 @@ def candidates(root: Path, index, changes: dict[str, str], timeout: float = 20.0
                 mask |= hits.get(line, 0)
             continue
         mask |= attr_mask
+    if body_cells and not derived and not failed_paths:
+        LAST_PURE_BODY = True
     for path in touched | failed_paths:
         mask |= keys["untracked"] & imports.get(path, -1)
-    if (touched | failed_paths | set(changes)) & set(world["eager"]):
+    if (touched | failed_paths | (set(changes) if derived or failed_paths else set())) & set(world["eager"]):
         if LAZY_LOAD in index.row and LAZY_LOAD in profile["ids"]:
             mask |= 1 << profile["ids"].index(LAZY_LOAD)
     return mask

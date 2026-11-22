@@ -1,0 +1,155 @@
+"""Build exec_phase1.json: deterministic Phase-1 dry-run fingerprints for executor TPC tests."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pickle
+import sys
+import time
+
+
+def _ast_fp(node, h):
+    """Feed exact AST structure + DataType annotations (ignoring comments) into blake2b."""
+    from sqlglot import exp
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, exp.Expr):
+            h.update(b"E:")
+            h.update(type(cur).__qualname__.encode())
+            h.update(b";")
+            if cur._type is not None:
+                h.update(b"T:")
+                stack.append(cur._type)
+            for k in sorted(cur.args):
+                v = cur.args[k]
+                h.update(b"K:")
+                h.update(k.encode())
+                h.update(b"=")
+                stack.append(v)
+        elif isinstance(cur, list):
+            h.update(b"L[")
+            h.update(str(len(cur)).encode())
+            h.update(b"]")
+            for x in reversed(cur):
+                stack.append(x)
+        elif isinstance(cur, tuple):
+            h.update(b"P(")
+            h.update(str(len(cur)).encode())
+            h.update(b")")
+            for x in reversed(cur):
+                stack.append(x)
+        else:
+            h.update(b"V:")
+            h.update(type(cur).__name__.encode())
+            h.update(b":")
+            h.update(repr(cur).encode())
+            h.update(b";")
+
+
+def eval_suite(kind, indices=None):
+    """Compute deterministic Phase-1 fingerprints for TPC-DS / TPC-H / optimized TPC-H queries."""
+    from sqlglot import exp, find_tables, parse_one, transpile
+    from sqlglot.executor.python import Python, PythonExecutor
+    from sqlglot.executor.table import Table, ensure_tables
+    from sqlglot.optimizer import optimize
+    from sqlglot.planner import Plan
+    from sqlglot.schema import ensure_schema
+    from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
+
+    if kind == "opt_tpch":
+        sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        want = range(len(sqls)) if indices is None else indices
+        out = {}
+        for i in want:
+            _, sql, opt = sqls[i]
+            a = transpile(sql, write="duckdb")[0]
+            b = transpile(opt, write="duckdb")[0]
+            out[i] = hashlib.blake2b(json.dumps([a, b]).encode(), digest_size=16).hexdigest()
+        return out
+
+    schema_dict = TPCDS_SCHEMA if kind == "tpcds" else TPCH_SCHEMA
+    rel = "optimizer/tpc-ds/tpc-ds.sql" if kind == "tpcds" else "optimizer/tpc-h/tpc-h.sql"
+    sqls = list(load_sql_fixture_pairs(rel))
+    empty_tables = {tbl: Table(columns=cols, rows=[]) for tbl, cols in schema_dict.items()}
+    schema = ensure_schema(schema_dict)
+    pygen = Python().generator(identify=True, comments=False)
+    want = range(len(sqls)) if indices is None else indices
+    out = {}
+    for i in want:
+        meta, sql, _ = sqls[i]
+        expr = pickle.loads(pickle.dumps(parse_one(sql)))
+        if not meta.get("execute"):
+            out[i] = {"exec": False, "py_fp": "noexec", "dk_fp": "", "tables": []}
+            continue
+        tnames = sorted({t.name for t in find_tables(expr)})
+        tables = ensure_tables({name: empty_tables[name] for name in tnames})
+        if tables.supported_table_args and tables.supported_table_args != schema.supported_table_args:
+            raise RuntimeError("supported_table_args mismatch")
+        optimized = optimize(expr, schema, leave_tables_isolated=True)
+        # Run debug formatters to catch exceptions just like execute() does
+        optimized.sql(pretty=True)
+        plan = Plan(optimized)
+        str(plan)
+        pe = PythonExecutor(tables=tables)
+        gen_log = []
+        orig_gen = pe.generator.generate
+        def logged_gen(e, _orig=orig_gen, _log=gen_log):
+            s = _orig(e)
+            _log.append(s)
+            return s
+        pe.generator.generate = logged_gen
+        result = pe.execute(plan)
+        seen_sq = set()
+        while True:
+            todo = sorted(k for k in pe._subquery_plans if k not in seen_sq)
+            if not todo:
+                break
+            for k in todo:
+                seen_sq.add(k)
+                subplan, _ = pe._subquery_plans[k]
+                pe.execute(subplan)
+        rt = pickle.loads(pickle.dumps(result))
+        # Deterministic fingerprint: opt_fp (for optimizer-only edits) and full py_fp
+        ho = hashlib.blake2b(digest_size=16)
+        ho.update(json.dumps(tnames).encode())
+        _ast_fp(optimized, ho)
+        opt_fp = ho.hexdigest()
+        h = hashlib.blake2b(digest_size=16)
+        h.update(json.dumps([tnames, list(rt.columns), sorted(gen_log)]).encode())
+        _ast_fp(optimized, h)
+        py_fp = h.hexdigest()
+        duck_sql = transpile(sql, write="duckdb")[0]
+        dk_fp = hashlib.blake2b(duck_sql.encode(), digest_size=16).hexdigest()
+        out[i] = {"exec": True, "opt_fp": opt_fp, "py_fp": py_fp, "dk_fp": dk_fp, "tables": sorted(set(tnames))}
+    return out
+
+
+def main():
+    root = os.path.abspath(sys.argv[1])
+    row_exec_path = sys.argv[2]
+    dest = sys.argv[3]
+    os.chdir(root)
+    os.environ["SKIP_INTEGRATION"] = "0"
+    sys.path.insert(0, root)
+    row_exec = json.load(open(row_exec_path))
+    t0 = time.process_time()
+    tpcds_a = eval_suite("tpcds")
+    tpcds_b = eval_suite("tpcds")
+    assert tpcds_a == tpcds_b, f"NON-DETERMINISTIC: {[i for i in tpcds_a if tpcds_a[i] != tpcds_b[i]]}"
+    tpch_a = eval_suite("tpch")
+    opt_a = eval_suite("opt_tpch")
+    t1 = time.process_time()
+    data = {
+        "row_exec_lines": row_exec,
+        "tpcds": [tpcds_a[i] for i in range(len(tpcds_a))],
+        "tpch": [tpch_a[i] for i in range(len(tpch_a))],
+        "opt_tpch": [opt_a[i] for i in range(len(opt_a))],
+    }
+    json.dump(data, open(dest, "w"), separators=(",", ":"))
+    print(f"built {dest} in {t1-t0:.2f}s (2x tpcds verified 100% deterministic); size={os.path.getsize(dest)}B")
+
+
+if __name__ == "__main__":
+    main()

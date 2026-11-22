@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 # Tests after which a class-level process pool was found broken, from the last probe.
+LAZY = False
 BROKEN: list[str] = []
 # Non-empty when the last probe ran every requested class to the end.
 COMPLETE: list[bool] = []
@@ -49,7 +50,11 @@ def _overlay(original: Path, shadow: Path, changes: dict[str, str]) -> None:
         if "" in descendants:
             if len(descendants) != 1:
                 raise ValueError("a file is also a directory")
-            destination.write_text(descendants[""], encoding="utf-8")
+            content = descendants[""]
+            if isinstance(content, bytes):
+                destination.write_bytes(content)
+            else:
+                destination.write_text(content, encoding="utf-8")
         else:
             destination.mkdir()
             _overlay(original / name, destination, descendants)
@@ -133,8 +138,34 @@ def _multiple_setups(root, ids):
     )
 
 
+def probe_slices(root: Path, changes: dict[str, str], spec: dict, timeout: float):
+    """True when the test passes on the given elements of its fixture list, False when it
+    fails, None when the run did not finish."""
+    for record in _invoke(root, changes, spec, timeout, "slices"):
+        if isinstance(record, dict) and "slices" in record:
+            return record["slices"]
+    return None
+
+
+def probe_phase1(root: Path, changes: dict[str, str], specs: list[dict], timeout: float) -> dict[str, dict]:
+    """Run deterministic Phase-1 dry-run checks for executor TPC tests in one fresh interpreter."""
+    out = {}
+    for record in _invoke(root, changes, specs, timeout, "phase1"):
+        if isinstance(record, dict) and "test" in record and "phase1" in record:
+            out[record["test"]] = record
+    return out
+
+
+def probe_tpc_csv(root: Path, changes: dict[str, bytes], spec: dict, timeout: float) -> dict | None:
+    """Validate a binary TPC .csv.gz edit against TestExecutor setup and the affected queries."""
+    for record in _invoke(root, changes, spec, timeout, "tpc_csv"):
+        if isinstance(record, dict) and "setup_ok" in record:
+            return record
+    return None
+
+
 def probe(
-    root: Path, changes: dict[str, str], ids: list[str], timeout: float
+    root: Path, changes: dict[str, str], ids: list[str], timeout: float, skip_executor_setup: bool = False
 ) -> set[str]:
     """Confirm ordinary unittest methods. Exclude pytest-specific setup and marks."""
     if any(
@@ -148,7 +179,8 @@ def probe(
     BROKEN.clear()
     COMPLETE.clear()
     groups = {tuple(node.split("::")[:2]) for node in ids}
-    for record in _invoke(root, changes, ids, timeout, "tests"):
+    payload = {"ids": ids, "skip_executor_setup": skip_executor_setup}
+    for record in _invoke(root, changes, payload, timeout, "tests"):
         if isinstance(record, list):
             passed.update(wanted.intersection(record))
         elif isinstance(record, dict) and record.get("broken") in wanted:
@@ -191,6 +223,22 @@ def _install_pool() -> None:
     import pickle
     from concurrent.futures.process import BrokenProcessPool
 
+    class Deferred(futures.Future):
+        _thunk = None
+
+        def _settle(self):
+            thunk, self._thunk = self._thunk, None
+            if thunk is not None:
+                thunk()
+
+        def result(self, timeout=None):
+            self._settle()
+            return super().result(timeout)
+
+        def exception(self, timeout=None):
+            self._settle()
+            return super().exception(timeout)
+
     class Pool(futures.Executor):
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
             self._broken = False
@@ -219,6 +267,15 @@ def _install_pool() -> None:
             except BaseException as error:
                 future.set_exception(error)
                 return future
+            if LAZY:
+                # Run the task when its result is asked for, so a failing element
+                # stops the test before the remaining ones are computed.
+                future = Deferred()
+                future._thunk = lambda: self._execute(payload, future)
+                return future
+            return self._execute(payload, future)
+
+        def _execute(self, payload, future):
             try:
                 function, values, options = pickle.loads(payload)
             except BaseException:
@@ -249,6 +306,7 @@ def _install_pool() -> None:
 
 
 def _run() -> None:
+    global LAZY
     import importlib
     import unittest
 
@@ -269,6 +327,285 @@ def _run() -> None:
         else:
             print("true", file=out)
         return
+    if sys.argv[-1] == "phase1":
+        import hashlib
+        import pickle
+        from sqlglot import exp, find_tables, parse_one, transpile
+        from sqlglot.executor.python import PythonExecutor
+        from sqlglot.executor.table import Table, ensure_tables
+        from sqlglot.optimizer import optimize
+        from sqlglot.planner import Plan
+        from sqlglot.schema import ensure_schema
+        from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA, load_sql_fixture_pairs
+
+        def _ast_fp(node, h):
+            stack = [node]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, exp.Expr):
+                    h.update(b"E:")
+                    h.update(type(cur).__qualname__.encode())
+                    h.update(b";")
+                    if cur._type is not None:
+                        h.update(b"T:")
+                        stack.append(cur._type)
+                    for k in sorted(cur.args):
+                        h.update(b"K:")
+                        h.update(k.encode())
+                        h.update(b"=")
+                        stack.append(cur.args[k])
+                elif isinstance(cur, list):
+                    h.update(b"L[")
+                    h.update(str(len(cur)).encode())
+                    h.update(b"]")
+                    for x in reversed(cur):
+                        stack.append(x)
+                elif isinstance(cur, tuple):
+                    h.update(b"P(")
+                    h.update(str(len(cur)).encode())
+                    h.update(b")")
+                    for x in reversed(cur):
+                        stack.append(x)
+                else:
+                    h.update(b"V:")
+                    h.update(type(cur).__name__.encode())
+                    h.update(b":")
+                    h.update(repr(cur).encode())
+                    h.update(b";")
+
+        for job in values:
+            test_id = job["test"]
+            kind = job["kind"]
+            indices = job["indices"]
+            expected = job["expected"]
+            try:
+                if kind == "opt_tpch":
+                    sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+                    if len(sqls) != job["size"]:
+                        raise RuntimeError("size changed")
+                    diff = []
+                    for i in indices:
+                        _, sql, opt = sqls[i]
+                        a = transpile(sql, write="duckdb")[0]
+                        b = transpile(opt, write="duckdb")[0]
+                        fp = hashlib.blake2b(json.dumps([a, b]).encode(), digest_size=16).hexdigest()
+                        if fp != expected[str(i)]:
+                            diff.append(i)
+                    if not diff:
+                        print(json.dumps({"test": test_id, "phase1": "pass"}), file=out, flush=True)
+                    else:
+                        print(json.dumps({"test": test_id, "phase1": "diff", "py_diff": diff, "dk_only": []}), file=out, flush=True)
+                    continue
+
+                schema_dict = TPCDS_SCHEMA if kind == "tpcds" else TPCH_SCHEMA
+                rel = "optimizer/tpc-ds/tpc-ds.sql" if kind == "tpcds" else "optimizer/tpc-h/tpc-h.sql"
+                sqls = list(load_sql_fixture_pairs(rel))
+                if len(sqls) != job["size"]:
+                    raise RuntimeError("size changed")
+                empty_tables = {tbl: Table(columns=cols, rows=[]) for tbl, cols in schema_dict.items()}
+                schema = ensure_schema(schema_dict)
+                py_diff, dk_only = [], []
+                diff_budget = job.get("diff_budget")
+                costs = job.get("costs")
+                opt_only = bool(job.get("opt_only")) and kind == "tpcds"
+                diff_cost = 0
+                aborted = False
+                for i in indices:
+                    meta, sql, _ = sqls[i]
+                    exp_i = expected[str(i)]
+                    expr = pickle.loads(pickle.dumps(parse_one(sql)))
+                    if not meta.get("execute"):
+                        if exp_i["exec"]:
+                            py_diff.append(i)
+                        continue
+                    if not exp_i["exec"]:
+                        py_diff.append(i)
+                        continue
+                    tnames = sorted({t.name for t in find_tables(expr)})
+                    if opt_only and "opt_fp" in exp_i:
+                        optimized = optimize(expr, schema, leave_tables_isolated=True)
+                        ho = hashlib.blake2b(digest_size=16)
+                        ho.update(json.dumps(tnames).encode())
+                        _ast_fp(optimized, ho)
+                        if ho.hexdigest() != exp_i["opt_fp"]:
+                            py_diff.append(i)
+                            if costs:
+                                diff_cost += costs[i]
+                        if diff_budget is not None and diff_cost > diff_budget:
+                            aborted = True
+                            break
+                        continue
+                    tables = ensure_tables({name: empty_tables[name] for name in tnames})
+                    if tables.supported_table_args and tables.supported_table_args != schema.supported_table_args:
+                        raise RuntimeError("supported_table_args mismatch")
+                    optimized = optimize(expr, schema, leave_tables_isolated=True)
+                    optimized.sql(pretty=True)
+                    plan = Plan(optimized)
+                    str(plan)
+                    pe = PythonExecutor(tables=tables)
+                    gen_log = []
+                    orig_gen = pe.generator.generate
+                    def logged_gen(e, _orig=orig_gen, _log=gen_log):
+                        s = _orig(e)
+                        _log.append(s)
+                        return s
+                    pe.generator.generate = logged_gen
+                    result = pe.execute(plan)
+                    seen_sq = set()
+                    while True:
+                        todo = sorted(k for k in pe._subquery_plans if k not in seen_sq)
+                        if not todo:
+                            break
+                        for k in todo:
+                            seen_sq.add(k)
+                            subplan, _ = pe._subquery_plans[k]
+                            pe.execute(subplan)
+                    rt = pickle.loads(pickle.dumps(result))
+                    h = hashlib.blake2b(digest_size=16)
+                    h.update(json.dumps([tnames, list(rt.columns), sorted(gen_log)]).encode())
+                    _ast_fp(optimized, h)
+                    py_fp = h.hexdigest()
+                    duck_sql = transpile(sql, write="duckdb")[0]
+                    dk_fp = hashlib.blake2b(duck_sql.encode(), digest_size=16).hexdigest()
+                    if py_fp != exp_i["py_fp"]:
+                        py_diff.append(i)
+                        if costs:
+                            diff_cost += costs[i]
+                    elif dk_fp != exp_i["dk_fp"]:
+                        dk_only.append(i)
+                        if costs:
+                            diff_cost += costs[i]
+                    if diff_budget is not None and diff_cost > diff_budget:
+                        aborted = True
+                        break
+                if aborted:
+                    print(json.dumps({"test": test_id, "phase1": "fail"}), file=out, flush=True)
+                elif not py_diff and not dk_only:
+                    print(json.dumps({"test": test_id, "phase1": "pass"}), file=out, flush=True)
+                else:
+                    print(json.dumps({"test": test_id, "phase1": "diff", "py_diff": py_diff, "dk_only": dk_only}), file=out, flush=True)
+            except BaseException:
+                print(json.dumps({"test": test_id, "phase1": "fail"}), file=out, flush=True)
+        return
+    if sys.argv[-1] == "tpc_csv":
+        LAZY = True
+        try:
+            module = importlib.import_module("tests.test_executor")
+            base = module.TestExecutor
+            suite = values["suite"]
+            table = values["table"]
+            indices = values.get("indices", [])
+            needed_tables = values.get("tables")
+            orig_tpch, orig_tpcds = module.TPCH_SCHEMA, module.TPCDS_SCHEMA
+            # 1. Verify setUpClass loads this modified CSV cleanly into both DuckDB and Table.
+            try:
+                if suite == "tpch":
+                    module.TPCDS_SCHEMA = {}
+                    module.TPCH_SCHEMA = {table: orig_tpch[table]}
+                else:
+                    module.TPCH_SCHEMA = {}
+                    module.TPCDS_SCHEMA = {table: orig_tpcds[table]}
+                base.setUpClass()
+                base.tearDownClass()
+            except BaseException:
+                print(json.dumps({"setup_ok": False}), file=out, flush=True)
+                return
+            finally:
+                module.TPCH_SCHEMA, module.TPCDS_SCHEMA = orig_tpch, orig_tpcds
+
+            # 2. Run only the affected tests (or sliced queries for TPC-DS).
+            if suite == "tpch":
+                class OnlyTPCH(base):
+                    @classmethod
+                    def setUpClass(cls):
+                        module.TPCDS_SCHEMA = {}
+                        try:
+                            super().setUpClass()
+                        finally:
+                            module.TPCDS_SCHEMA = orig_tpcds
+                failed = []
+                res = unittest.TestResult()
+                cases = {OnlyTPCH(m): f"tests/test_executor.py::TestExecutor::{m}"
+                         for m in ("test_execute_tpch", "test_optimized_tpch")}
+                unittest.TestSuite(list(cases)).run(res)
+                if any(t not in cases for t, _ in res.errors):
+                    failed = list(cases.values())
+                else:
+                    bad = {t for t, _ in res.errors + res.failures}
+                    failed = [cases[t] for t in bad if t in cases]
+                print(json.dumps({"setup_ok": True, "failed": failed}), file=out, flush=True)
+            else:
+                if not indices or needed_tables is None:
+                    print(json.dumps({"setup_ok": True, "tpcds_ok": False}), file=out, flush=True)
+                    return
+                class SlicedCSV(base):
+                    @classmethod
+                    def setUpClass(cls):
+                        module.TPCH_SCHEMA = {}
+                        want = set(needed_tables)
+                        module.TPCDS_SCHEMA = {k: v for k, v in orig_tpcds.items() if k in want}
+                        try:
+                            super().setUpClass()
+                        finally:
+                            module.TPCH_SCHEMA, module.TPCDS_SCHEMA = orig_tpch, orig_tpcds
+                        cls.tpcds_sqls = [cls.tpcds_sqls[i] for i in indices]
+                res = unittest.TestResult()
+                res.failfast = True
+                unittest.TestSuite([SlicedCSV("test_execute_tpcds")]).run(res)
+                ok = bool(res.testsRun == 1 and not res.errors and not res.failures
+                          and not res.skipped and not res.unexpectedSuccesses)
+                print(json.dumps({"setup_ok": True, "tpcds_ok": ok}), file=out, flush=True)
+        except BaseException:
+            print(json.dumps({"setup_ok": False}), file=out, flush=True)
+        return
+    if sys.argv[-1] == "slices":
+        # One fixture-driven test, with its loaded list cut down to the given elements.
+        LAZY = True
+        verdict = None
+        try:
+            filename, classname, method = values["test"].split("::")
+            module = importlib.import_module(filename[:-3].replace("/", "."))
+            base = getattr(module, classname)
+            attribute, indices = values["attr"], values["indices"]
+            setup_safe = bool(values.get("setup_safe"))
+            needed_tables = values.get("tables")
+            tpch_only = bool(values.get("tpch_only"))
+
+            class Sliced(base):
+                @classmethod
+                def setUpClass(cls):
+                    if setup_safe and filename == "tests/test_executor.py" and classname == "TestExecutor":
+                        orig_tpch, orig_tpcds = module.TPCH_SCHEMA, module.TPCDS_SCHEMA
+                        try:
+                            if needed_tables is not None:
+                                module.TPCH_SCHEMA = {}
+                                want = set(needed_tables)
+                                module.TPCDS_SCHEMA = {k: v for k, v in orig_tpcds.items() if k in want}
+                            elif tpch_only:
+                                module.TPCDS_SCHEMA = {}
+                            super().setUpClass()
+                        finally:
+                            module.TPCH_SCHEMA, module.TPCDS_SCHEMA = orig_tpch, orig_tpcds
+                    else:
+                        super().setUpClass()
+                    loaded = getattr(cls, attribute)
+                    if len(loaded) != values["size"]:
+                        raise RuntimeError("fixture list changed length")
+                    setattr(cls, attribute, [loaded[i] for i in indices])
+
+            result = unittest.TestResult()
+            result.failfast = True
+            unittest.TestSuite([Sliced(method)]).run(result)
+            verdict = bool(result.testsRun == 1 and not result.errors and not result.failures
+                           and not result.skipped and not result.unexpectedSuccesses)
+        except BaseException:
+            verdict = False
+        print(json.dumps({"slices": verdict}), file=out, flush=True)
+        return
+    skip_executor_setup = False
+    if isinstance(values, dict):
+        skip_executor_setup = bool(values.get("skip_executor_setup"))
+        values = values.get("ids", [])
     for node in values:
         parts = node.split("::")
         if len(parts) == 3 and parts[0].endswith(".py"):
@@ -310,6 +647,10 @@ def _run() -> None:
             }
             if not cases:
                 continue
+            if (skip_executor_setup and filename == "tests/test_executor.py" and classname == "TestExecutor"
+                    and not any(m in {"test_execute_tpcds", "test_execute_tpch", "test_optimized_tpch"} for m, _ in methods)):
+                cls.setUpClass = classmethod(lambda c: None)
+                cls.tearDownClass = classmethod(lambda c: None)
             result = Result()
             unittest.TestSuite(list(cases)).run(result)
             # unittest represents module/class fixture errors with a synthetic test object.

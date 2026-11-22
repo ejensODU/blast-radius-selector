@@ -180,7 +180,8 @@ def _same_code(left, right, loose=False):
     if left.co_varnames != right.co_varnames:
         named = left.co_argcount + left.co_kwonlyargcount + bool(left.co_flags & 4) + bool(left.co_flags & 8)
         if (not loose or len(left.co_varnames) != len(right.co_varnames)
-                or left.co_varnames[:named] != right.co_varnames[:named]):
+                or left.co_varnames[:named] != right.co_varnames[:named]
+                or (_names(left) | _names(right)) & _FRAME_READERS):
             return False
     return _same_code(left.co_consts, right.co_consts, loose)
 
@@ -207,7 +208,7 @@ class _DropPass(ast.NodeTransformer):
         return node
 
 
-_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\\S")
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\S")
 
 
 def _rename_shaped(changes):
@@ -240,9 +241,33 @@ def _refactor_only(original, modified, path, changes):
             codes.append(compile(ast.fix_missing_locations(tree), path, "exec", dont_inherit=True))
     except (SyntaxError, ValueError, RecursionError):
         return False
-    if (_names(codes[0]) | _names(codes[1])) & _FRAME_READERS:
-        return False
     return _same_code(codes[0], codes[1], loose=True)
+
+
+def _is_doc_stmt(stmt):
+    return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str))
+
+
+def _same_ast_no_doc(left, right):
+    """True when two ASTs are identical aside from module/class/function docstrings."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_same_ast_no_doc(a, b) for a, b in zip(left, right))
+    if not isinstance(left, ast.AST):
+        return left == right and type(left) is type(right)
+    has_doc = isinstance(left, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    for field in left._fields:
+        lv, rv = getattr(left, field), getattr(right, field)
+        if has_doc and field == "body":
+            lb = lv[1:] if lv and _is_doc_stmt(lv[0]) else lv
+            rb = rv[1:] if rv and _is_doc_stmt(rv[0]) else rv
+            if not _same_ast_no_doc(lb, rb):
+                return False
+        elif not _same_ast_no_doc(lv, rv):
+            return False
+    return True
 
 
 def _node_path(node: ast.AST, line: int, col: int):
@@ -352,6 +377,8 @@ def _one(patch, root):
     if (_same_code(code, updated) or (text_only and ast.dump(tree) == ast.dump(updated_tree))
             or _refactor_only(original, modified, path, changes)):
         return [Impact(path, "equivalent")]
+    if _same_ast_no_doc(tree, updated_tree):
+        return [Impact(path, "docstring")]
     executable = set(_executable(code))
     result = []
     for change in changes:

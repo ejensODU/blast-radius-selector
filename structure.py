@@ -145,9 +145,11 @@ def _inert(node, taken):
 
 
 class Resolver:
-    def __init__(self, index, root):
+    def __init__(self, index, root, probes=True, single=False):
         self.index = index
         self.root = Path(root)
+        self.probes = probes
+        self.single = single
         data = index.profile
         self.lines = data["lines"]
         self.reads = data["reads"]
@@ -204,7 +206,7 @@ class Resolver:
                 or (self.fs is not None and path in self.fs.get("opened", {})))
 
     # ---- file-level answers ----------------------------------------------
-    def appears(self, path):
+    def appears(self, path, section=None):
         """A path that did not exist before now does."""
         name = PurePosixPath(path).name
         parts = PurePosixPath(path).parts
@@ -223,6 +225,11 @@ class Resolver:
             dotted = ".".join((*parts[:-1], stem))
             failed = set(self.fs.get("failed_imports", ()))
             if dotted in failed or stem in failed and len(parts) == 1:
+                if (section is not None and path.startswith("sqlglot/") and path.endswith(".py")
+                        and not section.binary and section.hunks):
+                    wmask = self._new_sqlglot_world(path, section)
+                    if wmask is not None:
+                        return mask | wmask
                 return FULL
             if len(parts) == 1:
                 # The repository root is on sys.path ahead of the standard library.
@@ -239,13 +246,61 @@ class Resolver:
                     return FULL
         return mask
 
+    def _new_sqlglot_world(self, path, section):
+        """For an added sqlglot/*.py file containing only literal assignments, diff import state."""
+        if not self.probes:
+            return None
+        try:
+            from impact import apply_file, parse_patch
+            import world
+            added_lines = []
+            in_hunk = False
+            for line in section.lines:
+                if line.startswith("@@"):
+                    in_hunk = True
+                    continue
+                if not in_hunk:
+                    continue
+                if line.startswith("+"):
+                    added_lines.append(line[1:])
+                elif line.startswith("\\ No newline") and added_lines:
+                    added_lines[-1] = added_lines[-1].removesuffix("\n")
+                elif line.startswith(" "):
+                    added_lines.append(line[1:])
+            new_text = "".join(added_lines)
+            tree = ast.parse(new_text)
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    ast.literal_eval(node.value)
+                    if not all(isinstance(t, ast.Name) for t in node.targets):
+                        return None
+                elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    continue
+                else:
+                    return None
+            return world.candidates(self.root, self.index, {path: new_text}, allow_new=True)
+        except Exception:
+            return None
+
     def vanishes(self, path):
         name = PurePosixPath(path).name
         if name in _HOOK_NAMES or name in _CONFIG_NAMES or name == "__init__.py":
             return FULL
         if path.endswith(".py"):
             if path.startswith("sqlglot/"):
-                return FULL
+                try:
+                    import world
+                    wdata, keys = world._data()
+                    if keys["ids"] != self.index.profile["ids"] or path in wdata["eager"]:
+                        return FULL
+                    mask = self.index.by_file.get(path, 0) | self.reads.get(path, 0) | keys["imports"].get(path, 0) | keys["untracked"]
+                    for value in self.lines.get(path, {}).values():
+                        mask |= value
+                    for imp in wdata["importers"].get(path, ()):
+                        mask |= keys["imports"].get(imp, 0)
+                    return mask
+                except Exception:
+                    return FULL
             return self.users(path)
         return self.readers(path)
 
@@ -417,6 +472,101 @@ class Resolver:
                     return everyone
         return mask
 
+    def _apply_git_binary(self, orig_bytes, section_text):
+        import base64, zlib
+        lines = section_text.splitlines()
+        idx = next((i for i, l in enumerate(lines) if l.startswith("GIT binary patch")), None)
+        if idx is None or idx + 1 >= len(lines):
+            return None
+        header = lines[idx + 1].split()
+        if len(header) != 2 or header[0] not in ("literal", "delta"):
+            return None
+        kind, size = header[0], int(header[1])
+        out = bytearray()
+        for line in lines[idx + 2:]:
+            if not line.strip():
+                break
+            c = line[0]
+            n = (ord(c) - ord("A") + 1) if "A" <= c <= "Z" else (ord(c) - ord("a") + 27)
+            out.extend(base64.b85decode(line[1:])[:n])
+        raw = zlib.decompress(bytes(out))
+        if len(raw) != size:
+            return None
+        if kind == "literal":
+            return raw
+        pos = 0
+        def varint():
+            nonlocal pos
+            val = shift = 0
+            while True:
+                b = raw[pos]; pos += 1
+                val |= (b & 0x7f) << shift
+                if not (b & 0x80):
+                    return val
+                shift += 7
+        src_len, dst_len = varint(), varint()
+        if src_len != len(orig_bytes):
+            return None
+        dst = bytearray()
+        while pos < len(raw):
+            cmd = raw[pos]; pos += 1
+            if cmd & 0x80:
+                off = sz = 0
+                if cmd & 0x01: off |= raw[pos]; pos += 1
+                if cmd & 0x02: off |= raw[pos] << 8; pos += 1
+                if cmd & 0x04: off |= raw[pos] << 16; pos += 1
+                if cmd & 0x08: off |= raw[pos] << 24; pos += 1
+                if cmd & 0x10: sz |= raw[pos]; pos += 1
+                if cmd & 0x20: sz |= raw[pos] << 8; pos += 1
+                if cmd & 0x40: sz |= raw[pos] << 16; pos += 1
+                if sz == 0:
+                    sz = 0x10000
+                dst.extend(orig_bytes[off:off + sz])
+            elif cmd:
+                dst.extend(raw[pos:pos + cmd]); pos += cmd
+            else:
+                return None
+        return bytes(dst) if len(dst) == dst_len else None
+
+    def _binary_tpc_csv(self, path, section):
+        if not (self.probes and self.single and path.endswith(".csv.gz")
+                and (path.startswith("tests/fixtures/optimizer/tpc-h/")
+                     or path.startswith("tests/fixtures/optimizer/tpc-ds/"))):
+            return None
+        try:
+            orig = (self.root / path).read_bytes()
+            patched = self._apply_git_binary(orig, section.text)
+            if patched is None:
+                return None
+            suite = "tpch" if "/tpc-h/" in path else "tpcds"
+            table = PurePosixPath(path).name.removesuffix(".csv.gz")
+            indices = []
+            needed_tables = None
+            if suite == "tpcds":
+                p1 = json.loads((APP / "exec_phase1.json").read_text())
+                tpcds = p1.get("tpcds", [])
+                indices = [i for i, q in enumerate(tpcds) if q.get("exec") and table in q.get("tables", ())]
+                if len(indices) <= 6:
+                    needed_tables = sorted({t for i in indices for t in tpcds[i].get("tables", ())})
+            from probe import probe_tpc_csv
+            res = probe_tpc_csv(self.root, {path: patched},
+                                {"suite": suite, "table": table, "indices": indices, "tables": needed_tables},
+                                timeout=20.0)
+            if not res or not res.get("setup_ok"):
+                return None
+            # setUpClass loads cleanly: only tests that read this suite's tables can be affected.
+            name_to_bit = {n: 1 << i for i, n in enumerate(self.index.names)}
+            if suite == "tpch":
+                mask = 0
+                for tid in res.get("failed", ()):
+                    mask |= name_to_bit.get(tid, 0)
+                return mask
+            if res.get("tpcds_ok"):
+                return 0
+            return name_to_bit.get("tests/test_executor.py::TestExecutor::test_execute_tpcds", 0)
+        except Exception:
+            return None
+
     # ---- one section -----------------------------------------------------
     def resolve(self, section):
         """Returns ("plain", None), ("mask", int) or ("mask", FULL)."""
@@ -435,7 +585,7 @@ class Resolver:
         if section.status == "add":
             if (self.root / path).exists():
                 return "mask", FULL
-            return "mask", self.appears(path)
+            return "mask", self.appears(path, section)
         if not (self.root / path).is_file():
             return "mask", FULL
         if section.status == "delete":
@@ -443,6 +593,9 @@ class Resolver:
         if section.binary:
             if path.endswith(_IMPORT_SUFFIXES):
                 return "mask", FULL
+            csv_mask = self._binary_tpc_csv(path, section)
+            if csv_mask is not None:
+                return "mask", csv_mask
             return "mask", self.readers(path)
         if not section.hunks:
             return "mask", 0
@@ -475,7 +628,7 @@ class Resolver:
         return "plain", None
 
 
-def resolve(text, index, root):
+def resolve(text, index, root, probes=True):
     """Split a patch into the part the ordinary analysis handles and a set of tests for the rest.
 
     Returns (plain_text, mask); mask is FULL when some section cannot be judged.
@@ -483,7 +636,7 @@ def resolve(text, index, root):
     parts = sections(text)
     if parts is None:
         return text, 0
-    resolver = Resolver(index, root)
+    resolver = Resolver(index, root, probes=probes, single=(len(parts) == 1))
     plain, mask = [], 0
     for section in parts:
         try:
