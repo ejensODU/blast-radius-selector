@@ -207,8 +207,32 @@ class _DropPass(ast.NodeTransformer):
         return node
 
 
-def _refactor_only(original, modified, path):
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\\S")
+
+
+def _rename_shaped(changes):
+    """Cheap screen: do the edited lines differ only in identifiers or in `pass` lines?"""
+    import keyword
+    for block in changes:
+        before = [line for line in block.before if line.strip() != "pass"]
+        after = [line for line in block.after if line.strip() != "pass"]
+        if len(before) != len(after):
+            return False
+        for old, new in zip(before, after):
+            left, right = _WORD.findall(old), _WORD.findall(new)
+            if len(left) != len(right):
+                return False
+            for x, y in zip(left, right):
+                if x != y and not (x.isidentifier() and y.isidentifier()
+                                   and not keyword.iskeyword(x) and not keyword.iskeyword(y)):
+                    return False
+    return True
+
+
+def _refactor_only(original, modified, path, changes):
     """Same program after dropping redundant `pass` statements and local variable names."""
+    if not _rename_shaped(changes):
+        return False
     try:
         codes = []
         for text in (original, modified):
@@ -326,7 +350,7 @@ def _one(patch, root):
     text_only = all(not line.strip() or line.lstrip().startswith("#")
                     for block in changes for line in (*block.before, *block.after))
     if (_same_code(code, updated) or (text_only and ast.dump(tree) == ast.dump(updated_tree))
-            or _refactor_only(original, modified, path)):
+            or _refactor_only(original, modified, path, changes)):
         return [Impact(path, "equivalent")]
     executable = set(_executable(code))
     result = []
